@@ -98,6 +98,9 @@ pub struct Ledger {
     /// The functions whose float return is withdrawn: redone without the
     /// float-register vote on the return, and without a forced return.
     pub withdrawn: BTreeSet<(int4, uintb)>,
+    /// Per function returning a float, the callees whose float return it hands
+    /// on as its own ([`float_sources`]).
+    pub float_sources: BTreeMap<(int4, uintb), BTreeSet<(int4, uintb)>>,
     /// The functions a forced return left returning a register a call only
     /// clobbers: withdrawn like a refused float return.
     pub unset: BTreeSet<(int4, uintb)>,
@@ -154,6 +157,12 @@ pub fn record(arch: &mut Architecture, entry: &Address, data: &Funcdata) {
     arch.kuna_voidret.ops.insert(own, data.obank().iter_alive().count());
     if returns == Some(Returns::Float) && converts_its_return(data) {
         arch.kuna_voidret.float_refused.entry(own).or_default().insert(own);
+    }
+    let sources = if returns == Some(Returns::Float) { float_sources(data) } else { BTreeSet::new() };
+    if sources.is_empty() {
+        arch.kuna_voidret.float_sources.remove(&own);
+    } else {
+        arch.kuna_voidret.float_sources.insert(own, sources);
     }
     if !data.kuna_forced_return().is_empty() && returns_a_call_clobber(data) {
         arch.kuna_voidret.unset.insert(own);
@@ -307,17 +316,76 @@ fn converts_its_return(data: &Funcdata) -> bool {
 /// return and without a forced return, so the listing declares what every
 /// reader takes (`unsigned int`, or `void` as before a redo made it return),
 /// and the readers are decompiled again against that.
+///
+/// A function that hands on a callee's float return keeps returning a float
+/// once withdrawn, `double wrapd(..) { return getd(..); }` beside a `getd` the
+/// vote made return `double`, and its reader's `dat_4060 = wrapd(..)` then
+/// converts by value. So the callees whose float it hands on are withdrawn
+/// with it, and theirs in turn, down the chain ([`float_sources`]).
 pub fn withdrawals(arch: &mut Architecture) -> BTreeSet<(int4, uintb)> {
     let ledger = &mut arch.kuna_voidret;
-    let out: BTreeSet<(int4, uintb)> = ledger
-        .float_refused
-        .iter()
-        .filter(|(k, readers)| !readers.is_empty() && ledger.returns.get(k) == Some(&Returns::Float))
-        .map(|(k, _)| *k)
-        .chain(ledger.unset.iter().copied())
-        .filter(|k| !ledger.withdrawn.contains(k))
-        .collect();
+    let float = |k: &(int4, uintb)| ledger.returns.get(k) == Some(&Returns::Float);
+    let refused: Vec<(int4, uintb)> =
+        ledger.float_refused.iter().filter(|(k, readers)| !readers.is_empty() && float(k)).map(|(k, _)| *k).collect();
+    let mut out: BTreeSet<(int4, uintb)> =
+        refused.iter().chain(ledger.unset.iter()).copied().filter(|k| !ledger.withdrawn.contains(k)).collect();
+    let mut work = refused;
+    let mut seen = BTreeSet::new();
+    while let Some(k) = work.pop() {
+        if !seen.insert(k) {
+            continue;
+        }
+        for s in ledger.float_sources.get(&k).into_iter().flatten().filter(|s| float(s)) {
+            if !ledger.withdrawn.contains(s) {
+                out.insert(*s);
+            }
+            work.push(*s);
+        }
+    }
     ledger.withdrawn.extend(out.iter().copied());
+    out
+}
+
+/// The callees, last recovered returning a float, whose result reaches a live
+/// RETURN of `data` through copies and joins: the float the function returns
+/// is theirs.
+fn float_sources(data: &Funcdata) -> BTreeSet<(int4, uintb)> {
+    use kuna_num::opcodes::OpCode;
+    let mut work: Vec<crate::context::VarnodeId> = data
+        .obank()
+        .iter_code(OpCode::CPUI_RETURN)
+        .filter_map(|r| data.obank().get(r).filter(|o| !o.is_dead() && o.get_halt_type() == 0))
+        .flat_map(|o| (1..o.num_input()).filter_map(|s| o.get_in(s)).collect::<Vec<_>>())
+        .collect();
+    let mut out = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) || seen.len() > 256 {
+            continue;
+        }
+        let Some((d, def)) = data.vbank().get(v).and_then(|n| n.get_def()).and_then(|d| Some((d, data.obank().get(d)?)))
+        else {
+            continue;
+        };
+        let fc = match def.code() {
+            OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => data.get_call_specs_index(d).map(|i| data.get_call_specs(i)),
+            OpCode::CPUI_INDIRECT if def.is_indirect_creation() => call_of(data, def),
+            OpCode::CPUI_COPY | OpCode::CPUI_INDIRECT | OpCode::CPUI_CAST | OpCode::CPUI_SUBPIECE => {
+                work.extend(def.get_in(0));
+                continue;
+            }
+            OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_PIECE => {
+                work.extend((0..def.num_input()).filter_map(|k| def.get_in(k)));
+                continue;
+            }
+            _ => continue,
+        };
+        let Some(fc) = fc.filter(|fc| !fc.proto().is_output_locked()) else { continue };
+        let Some(k) = key(fc.get_entry_address()) else { continue };
+        if data.kuna_callee_returns(k) == Some(Returns::Float) {
+            out.insert(k);
+        }
+    }
     out
 }
 

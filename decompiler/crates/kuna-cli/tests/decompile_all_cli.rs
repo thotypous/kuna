@@ -2762,14 +2762,26 @@ fn a_nan_returned_in_s0_round_trips() {
 /// as, holding the bits `bits`: a round trip hands each function the bits the
 /// binary does, whichever type the listing gave the parameter.
 fn arg_of_bits(printed: &str, name: &str, index: usize, bits: u64) -> String {
+    let ty = param_type(printed, name, index);
+    format!("({{ {ty} t_; unsigned long long u_ = {bits:#x}ULL; memcpy(&t_, &u_, sizeof t_); t_; }})")
+}
+
+/// An argument for parameter `index` of the printed function `name` holding
+/// the address `expr`, whether the listing declares a pointer or a `long`.
+fn arg_of_pointer(printed: &str, name: &str, index: usize, expr: &str) -> String {
+    let ty = param_type(printed, name, index);
+    format!("({{ {ty} t_; const void *p_ = {expr}; memcpy(&t_, &p_, sizeof t_); t_; }})")
+}
+
+/// The type the printed function `name` declares for parameter `index`.
+fn param_type(printed: &str, name: &str, index: usize) -> String {
     let head = printed
         .lines()
         .find(|l| !l.starts_with("//") && l.contains(&format!(" {name}(")))
         .unwrap_or_else(|| panic!("no signature for {name}:\n{printed}"));
     let params = &head[head.find('(').unwrap() + 1..head.rfind(')').unwrap()];
     let param = params.split(',').nth(index).unwrap_or_else(|| panic!("{name} has no parameter {index}: {head}")).trim();
-    let ty = param.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_').trim();
-    format!("({{ {ty} t_; unsigned long long u_ = {bits:#x}ULL; memcpy(&t_, &u_, sizeof t_); t_; }})")
+    param.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_').trim().to_string()
 }
 
 /// `floatret_calls_{clang,gcc}_O0`: `signbit_` hands its float to `f2u`, which
@@ -2885,6 +2897,59 @@ fn a_float_pair_held_as_an_integer_round_trips() {
             "{cc}: the printed C stores something else:\n{printed}"
         );
     }
+}
+
+/// `floatret_chain_gcc_O1` (gcc -O1, stripped): `wrapd` hands on the `double`
+/// `getd` returns in `xmm0` (`call; ret`), `wrap2` hands on `wrapd`'s, and
+/// `wrapp` the `struct { float, float }` of `getp`; each reader copies the eight
+/// bytes into a `uint64_t` global. A reader keeping the bits as an integer
+/// withdrew the wrapper's float return, but the float came from the getter's
+/// own, which stayed: the wrapper still returned `double`, and the reader's
+/// `dat_40a0 = sub_1156(a0,a1)` converted 2.25 to 2. The getters are withdrawn
+/// with the wrappers, and the printed functions, compiled with gcc and clang,
+/// store the fixture's bits. `floatret_chain_mips_O0` (mipsel gcc -O0) hands a
+/// `float` in `$f0` through `wrapf` the same way: nothing on that chain is a
+/// float either.
+#[test]
+fn a_float_handed_on_through_wrappers_to_an_integer_round_trips() {
+    let sp = specs();
+    let fixture = |name: &str| repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures").join(name).to_str().unwrap().to_string();
+    let bin = fixture("floatret_chain_gcc_O1");
+    let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+    assert!(ok, "kuna decompile-all failed: {stderr}");
+    let names = ["sub_1149 ", "sub_1156 ", "sub_1160 ", "sub_1181 ", "sub_118e ", "sub_1198 ", "sub_11ba ", "sub_11ff "];
+    let printed = printed_functions(&stdout, &names);
+    for want in ["unsigned long sub_1156(long a0,int a1)", "unsigned long sub_1160(long a0,int a1)", "unsigned long sub_118e(long a0,int a1)"] {
+        assert!(printed.contains(want), "missing `{want}`:\n{printed}");
+    }
+    assert!(!printed.contains("double"), "a function of the chain returns a float:\n{printed}");
+    let globals: String =
+        ["dat_40a0", "dat_40a8", "dat_40b0", "dat_40b8", "dat_40d0", "dat_40d8"].iter().map(|g| format!("unsigned long {g};\n")).collect();
+    let src = format!(
+        "#include <stdio.h>\n#include <string.h>\n\
+         double darr[4] = {{1.5, -0.0, 2.25, 3.0}};\n\
+         struct {{ float x, y; }} parr[4] = {{{{1.0f, 2.0f}}, {{3.0f, 4.0f}}, {{5.0f, 6.0f}}, {{7.0f, 8.0f}}}};\n\
+         {globals}{printed}\n\
+         int main(void) {{\n  sub_1198({}, 2);\n  sub_11ba({}, 3);\n  sub_11ff({}, 1);\n  \
+         printf(\"%lx %lx %lx %lx %lx %lx\\n\", dat_40a0, dat_40a8, dat_40b0, dat_40b8, dat_40d0, dat_40d8);\n  return 0;\n}}\n",
+        arg_of_pointer(&printed, "sub_1198", 0, "darr"),
+        arg_of_pointer(&printed, "sub_11ba", 0, "darr"),
+        arg_of_pointer(&printed, "sub_11ff", 0, "parr"),
+    );
+    for (cc, got) in compile_and_run_each("floatret-chain", &src) {
+        assert_eq!(
+            got, "4002000000000000 40020000 4008000000000000 40080000 4080000040400000 40800000",
+            "{cc}: the printed C stores something else:\n{printed}"
+        );
+    }
+    let mips = fixture("floatret_chain_mips_O0");
+    let (stdout, stderr, ok) = run_kuna(&["decompile-all", &mips, "--sleighpath", &sp]);
+    assert!(ok, "kuna decompile-all failed: {stderr}");
+    let printed = printed_functions(&stdout, &["sub_40085c ", "sub_400898 ", "sub_400b78 "]);
+    for want in ["unsigned int sub_40085c(int a0,int a1)", "unsigned int sub_400898(int a0,int a1)", "dat_4120e0 = sub_400898(a0,a1);"] {
+        assert!(printed.contains(want), "missing `{want}`:\n{printed}");
+    }
+    assert!(!printed.contains("float"), "a function of the chain returns a float:\n{printed}");
 }
 
 /// `dsum`, `norm` and `use` read their argument as `double *`, `struct P *` and
