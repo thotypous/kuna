@@ -1221,6 +1221,43 @@ output sits at the constructed join address (falling back to the first piece
 if no join can be built); more pieces chain PIECEs over contiguous trials.
 The (kuna) `returnpair` gate intercepts this join — §4.4.
 
+Which of the two pieces is the high half is the ABI's answer, not the trial
+order's. The trials sort in storage order, first register first, and the output
+rule that matched them records whether it consumes the most significant piece
+first. A `<join>` rule does by default on every big-endian target, because a
+register pair holds a wide value the way a load from memory would put it there,
+lower address (the high word) in the first register. PowerPC returns a `long
+long` in `r3:r4` with the high word in `r3`, MIPS o32 in `$2:$3`, SPARC in
+`%o0:%o1`, ARM big-endian in `r0:r1`, and AArch64 big-endian an `__int128` in
+`x0:x1`, each with the high half first. The flag is the rule's, not the target's
+endianness: `reversesignif` flips it, and AVR's gcc spec, little-endian, lists
+`R25` first and joins with `reversesignif="true"`, so its `int` comes back with
+the high byte in `R25`, the first register, too. The PIECE takes its high input
+from the trial `ParamActive::join_pair_order` names
+(`decompiler/crates/kuna-decomp/src/p4_calls/fspec.rs (ParamActive::join_pair_order)`),
+and the call-output pair below reads the same flag. Upstream reads it at the
+call and not at the return, so its return joined the first register as the low
+half wherever the flag is set and printed `wide_mul` as `CONCAT44(low,high)`;
+kuna reads it at both. A little-endian rule without `reversesignif` never sets
+it, so those joins are exactly upstream's. A cspec whose single join entry names
+the pieces itself (the 68000's `D0:D1`) never reaches the flag: its trials sort
+by their justified offset, which already puts the low half first. Two-register
+*parameters* are never joined at all (`ActionParamDouble` below is a no-op), so a
+`long long` argument prints as its two registers in the ABI's order and no order
+assumption applies there.
+
+When the two registers are contiguous in the joined order, the whole is built at
+their parent register rather than in the join space (`constructJoinAddress`).
+AVR maps its register file into data memory, so that parent, `R25R24`, is a
+global: a value built there merged with the argument bytes it is made of, the
+PIECE became internal to one variable, and `negate` printed `return R25R24;`, a
+read of a register the printed C never assigns. A pair whose parent register is
+global storage therefore still gets a join record over its two registers, which
+keeps it a value (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_rustabi.rs
+(pair_join_address)`); the call-output pair builds its whole the same way.
+Register-space parents (`r3:r4` is not a named register, `EDX:EAX` is not
+contiguous) are unaffected.
+
 The sole-use check has one narrow terminating-path exception, the (kuna)
 `noreturnretuse` gate (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_noreturnretuse.rs
 (call_cannot_reach_return)`). When the use being matched is a RETURN, a candidate
@@ -1675,9 +1712,146 @@ return is safe from it twice over: both halves of a real struct return are
 computed (built from constants, arithmetic, or loads through a pointer — a LOAD
 is not a move, so the walk stops there), and the rule only ever edits a value
 concatenated from two halves, never a lone recovered return register. Where every
-half is uncomputed — the synthesized-return case — the low, first-in-class
-register is kept so the function's output storage still agrees across every
-RETURN.
+half is uncomputed — the
+synthesized-return case — the first-in-class register is kept so the
+function's output storage still agrees across every RETURN: the low half when the rule joined the first register low, the high half
+when it joined it high. The repair reads that order back from where the halves
+sit: the high half occupies the earlier of the model's output entries exactly
+when the rule consumed the most significant piece first
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(first_register_holds_high)`), the same answer `ParamActive::join_pair_order`
+gave while the trials were live, big-endian or `reversesignif` alike. A pair is
+two of the model's output registers, whether return recovery built a join or the
+two registers were contiguous and merged into one wider Varnode (SPARC's
+`%o0:%o1` does); one register's high bits are never kept alone.
+
+A pair joined first register high needs one more step, because the repair finds
+a pair by the `PIECE` return recovery built and the correct join puts the
+computed value on top of it: the rule pool folds a zero-extended or zero half out
+of the concatenation (`PIECE(ZEXT(x),y)` becomes `ZEXT(PIECE(x,y))`, `PIECE(0,y)`
+becomes `ZEXT(y)`, `PIECE(x,0)` becomes `ZEXT(x) << 32`) long before the one-shot
+tail, and the repair no longer sees it. SPARC is where this matters: `save` copies
+every out-register into its in-register and `restore` copies them back, so `%o1`
+reaches the RETURN holding whatever the function last left in `%i1` on every
+function that opened a window, and passes ancestor realism. A leaf function that
+leaves `%o1` untouched has the trial rejected outright; for a window pair, return
+recovery classifies the second register once the output map is derived
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(classify_window_pair)`), on a pair joined most significant first. At every live
+RETURN it must be the output of a register-window move: a copy of one register
+into another at an instruction that copies every general-purpose argument
+register of the model, out of them or back into them, the other copies' far end
+possibly a heritage temporary where a register is also accessed as part of a
+wider pair (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(moves_register_window)`). `restore`'s own destination write is not one:
+`restore %g0,1,%o1` is `tmp = 0 + 1`, the window's copies, then `%o1 = tmp`, a
+copy of a temporary into the register the compiler chose, so a function that
+writes `%o1` that way returns an ordinary pair (`return 1` for a `long long`,
+where the window reading printed `return 0`). Behind the window move, `%i1`'s
+value is followed back through the window's copies, indirects and phis
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(window_values)`) to the value it had on entry, a literal (a constant, or integer
+arithmetic on constants, since the rule pool has not folded clang's `sethi
+0,%i1; add %i1,0,%i1` yet), or any other value. A copy a compiler chose is such a
+value: ARM big-endian's `mov r4,r1; bl ext; mov r0,#0; mov r1,r4`, which carries
+the second argument across a call into the low word of a returned `long long`,
+keeps its pair (`return a1`, as the little-endian build prints), and so does a
+literal a leaf function puts in `%o1` directly. A literal that also reaches the
+first register, unchanged (through copies, phis and `0 + x`) or through any
+operation but a sign extension, is set aside as that register's scratch:
+`mov 2,%i1; ret; restore %g0,%i1,%o0` returns the `int` 2, and a flag ORed into
+the `int` in `%i0` is left in `%i1`. A `long long` whose two words are the same
+literal is no value but -1, which stays (clang -O0 builds `return -1LL` exactly
+that way), or 0, which reads the same either way. A computed value copied into
+both registers is set aside only when its top bit is clear (`ldub` then
+`restore %g0,%i1,%o0`), where the same holds; one that may be -1 keeps the pair,
+which reads right as either type (clang -O0 reloads `c ? -1 : 0` into `%i1` and
+copies it into `%o0`). A RETURN all of whose paths are set aside holds a
+leftover; otherwise the remaining paths decide, so a `(0, 0)` path beside a
+computed 64-bit value keeps the pair. The remaining literals and values are
+followed forward: when they, and everything computed from them, reach only
+RETURNs, the function put them in `%i1` to return them, since a compiler keeps
+no value nobody reads. `mov 10,%i1; ret;
+restore %g0,%g0,%o0` returns 10 in the low word, and the function returns an
+ordinary pair. The pieces heritage split the register into where the function
+also reads part of it count as the value (clang's `stb %i1` reads its low
+byte), a phi heritage placed that nothing reads yet reaches nothing, and a load
+through the value is a use of it, not a value returned. The second register is
+then judged over every live RETURN: returned on purpose at any of them, the pair
+is an ordinary one; otherwise a *leftover* when at some RETURN it holds its entry
+value, a literal the function built the first register from, or one it also
+stored, branched on, passed to a call or loaded through (an `int` function that
+leaves the untouched argument in `%i1` on its error path and a loop counter on
+the other returns no low word on either); and *handed back* when at every
+RETURN it holds a value the function computed and also used.
+Both tests skip a RETURN reached only along branch edges whose
+conditions literals decide the other way: SPARC's `call` pcode keeps
+`if (didrestore == 0) goto next; return [o7];` for a `restore` in its delay slot,
+and with `didrestore = 0` that RETURN is dead, but return recovery settles the
+prototype before the rule pool folds it away, and there `%o1` is whatever the call
+was passed (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(never_reached)`).
+
+The pair is built either way, and the late repair keeps a leftover pair's first
+register from the `PIECE` (a literal second register counts as leftover there).
+Next to a zero first register, though, the leftover decides what the rule pool
+folds the join into: `PIECE(0, a1)` becomes `ZEXT(a1)`, indistinguishable from
+returning the argument. So return recovery replaces the second register with zero
+in each RETURN's `PIECE` whose first register is zero, right after the join and
+again at the start of every later pass, before the rule pool sees it (a first
+register can become zero on one path only once conditional constant propagation
+has run; `decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(zero_leftover_low_half)`). The join then folds into a literal. The late repair
+reads the two shapes a zero low half folds into, for any window pair, and repairs
+a window pair at every live RETURN or at none, since when one RETURN keeps both
+registers a zero low half at another is part of the same value
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(strip_uncomputed_return_piece)`). It repoints every RETURN before it removes
+any concatenation, so one RETURN's cleanup never frees a Varnode another RETURN
+now reads. The repair takes
+`x` out of `ZEXT(x) << 32`
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(shifted_high_half)`), and hands the RETURN the high half of a literal as a new
+constant, the output storage then being the first register rather than the
+constant's own address (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(window_high_storage)`). A handed-back register the function computed reaches the
+same shapes when conditional constant propagation shows it zero at every exit --
+the pointer a `for (p = head; p; p = p->next)` loop leaves on, the last byte a
+scan tested. Only a pair the rule pool folded into another shape is narrowed
+during the main loop instead, each RETURN given `SUBPIECE(whole, lo)` stored in
+the first register (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_returnuncomputed.rs
+(narrow_window_pair)`): a leftover pair (`CONCAT44(x, a1) & 0xffffffffffff` from
+a masked return), or one whose low half is zero at every RETURN whatever the
+inputs hold (shifts, masks, concatenations and constants, `low_bits_zero`;
+`(ZEXT(x) << 32) ^ k`). The RETURN keeps reading the whole pair until the one-shot
+tail otherwise, which matters for printing: a single `%o0` return present during
+merging becomes one variable with every other value SPARC's unrelocated calls
+leave in `%o0`, the first argument among them, and prints as `a0 = 1; return
+a0;`. `return a0 == a1`, `return 0` and a function that zeroes `%i1` to store a
+byte print as one `int` on SPARC again. Only the entry value is truly
+ambiguous: the window makes `int f(int a,unsigned b){ext();return 0;}` and
+`unsigned long long f(int a,unsigned b){ext();return b;}` the same bytes (clang
+-O2), and the one-register reading is taken, as for a leaf function. A literal or
+value the function writes into `%o1` itself, or into `%i1` for the window to hand
+back, is told apart by what reads it, as above. A value the function computed and
+also used that is zero at every exit only by the control flow (the loop pointer
+above) is still read as scratch, so a genuine `long long` whose low word comes
+out zero that way prints its high word alone.
+
+When `%i1` holds a value the function computed and it is not zero at every return,
+`%o1` forms a pair: clang at -O0 reloads spilled values into `%i1` (`ld
+[%fp-4],%i1`), so its `int same(unsigned a,unsigned b)` still prints as a pair of
+the comparison and the reload, and bzip2's -O0 `blocksort` functions return one.
+The same holds on every target without a window for a second register left
+holding a value the function did not mean to return (a zero clang -O0
+materializes in MIPS `$3` is `(unsigned long long)x << 32`'s machine code there):
+it forms a pair, printed in the ABI's order. When the second register is the
+argument reloaded from its stack slot, the entry value only shows once heritage
+has resolved the reload, so that case reaches the late repair folded; on a pair
+joined first register high the repair therefore also looks through
+`ZEXT(PIECE(x, lo))` and, when it keeps the high half, keeps `x`, the value
+before its extension: the same narrow return the single-register path prints on
+every other target.
 
 This subsumes `returnpair` on the GH-6990 case it was written for (`tests/stages/
 gh6990-returnpair.xml` now records both passes agreeing); the flag remains as the
@@ -1954,6 +2128,14 @@ arm with the language test dropped, and nothing else: the classification is
 `build_call_output_pair` is the same code — the two options simply both reach it.
 `rustabi` keeps the producer-side pair (`holds_scalar_pair`, which `callretpair`
 does not touch), so a rustc image behaves identically whichever is set.
+
+Both classifiers reason about registers, not significance: the callee veto asks
+about the *second* register, and the producer's tag test about the *first*,
+where rustc puts the discriminant. `build_call_output_pair` alone decides which
+register is the high half, from `ParamActive::join_pair_order` exactly as return
+recovery does, so a big-endian call output reads `r3`/`$2`/`%o0`/`r0` as the
+high word; `holds_scalar_pair` maps the PIECE's halves back to register order
+with `first_register_holds_high` before asking for the tag.
 
 The reach is whatever the cspec's output model asks for, not an architecture
 list: two used output trials arise wherever a convention describes its return

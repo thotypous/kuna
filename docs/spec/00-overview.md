@@ -2491,6 +2491,14 @@ module docs):
 | `decompiler/crates/kuna-decomp/src/p6_variables/funcdata_facing.rs`, `decompiler/crates/kuna-decomp/src/p6_variables/funcdata_merge.rs`, `decompiler/crates/kuna-decomp/src/p6_variables/funcdata_spacebase.rs` | variable/merge/stack tiers (P6) |
 | `decompiler/crates/kuna-decomp/src/p9_emit/coreaction_casts.rs` | cast insertion hooks (P9) |
 
+Freeing a Varnode takes it out of the HighVariable that lists it, as the C++
+`~Varnode` does, whichever primitive frees it: `destroy_varnode`, and the dead
+Varnodes the dead-code pass clears
+(`decompiler/crates/kuna-decomp/src/substrate/funcdata_varnode.rs
+(clear_dead_varnodes)`). Once variables are merged, an input a late repair left
+unread is cleared there; left in its variable, it is a stale member the naming
+pass reads.
+
 **Data types are shared IR, not per-function state.** The type factory
 (`decompiler/crates/kuna-decomp/src/substrate/dtype.rs (TypeFactoryImpl)`) is one
 `Rc` owned by the engine and shared into every per-function handle

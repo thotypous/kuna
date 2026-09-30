@@ -1,0 +1,112 @@
+<decompilertest>
+<binaryimage arch="sparc:BE:32:default:default">
+<!--
+    kuna strict fix (no option): SPARC returns a long long in %o0:%o1 with the
+    HIGH word in %o0, and returns an int in %o0 alone.
+
+    The same join-order bug as kuna-bejoin.xml (the PowerPC case): return
+    recovery joined %o0 as the LOW word, so wide_mul printed
+    CONCAT44(low,high).  SPARC adds a second shape.  `restore` copies every
+    in-register back to its out-register, so %o1 reaches the RETURN holding
+    the incoming second argument, and both registers look returned.  The
+    uncomputed-half repair used to drop that %o1 only by accident of the wrong
+    order.  With the order fixed, a %o1 the window hands back holding its entry
+    value, or a literal the function also used for something else, is a
+    leftover, and the function returns %o0 alone.  Before the fix:
+
+        wide_mul:  return CONCAT44((int4)((int8)a1 * a0),... >> 0x20);   (halves swapped)
+        same:      if (a0 == a1) return 1; return (uint8)a1 << 0x20;    (returns a1 << 32)
+        keep_zero: *a0 = a1; return (uint8)a1 << 0x20;                 (returns a1 << 32)
+
+    Stage: P4 calls and prototypes (output-prototype).  No option: this only
+    corrects wrong output, and every little-endian target is byte-identical.
+
+    Source (clang 14 -O2, sparc-linux-gnu, bytes from bejoin_sparc32_be.o):
+        long long wide_mul(int a, int b) { return (long long)a * b; }
+          save / smul %i1,%i0,%i1 / rd %y,%i0 / ret / restore
+        unsigned int same(unsigned int a, unsigned int b) { return a == b; }
+          save / cmp %i0,%i1 / be / ret / restore %g0,%g0,%o0 / ret / restore %g0,1,%o0
+        int keep_zero(int *p, int b) { *p = b; return 0; }
+          save / mov %g0,%i2 / st %i1,[%i0] / ret / restore %g0,%i2,%o0
+
+    The window hands back whatever %i1 holds, not only the argument.  From
+    bejoin_window.c (clang 14, sparc-linux-gnu, bytes from
+    bejoin_window_sparc32_O2.o at 0x20000 and bejoin_window_sparc32_O0.o's
+    mark at 0x30000), four functions that return one int.  Before:
+
+        back4 -O2:      return (uint8)((int4)v1[-3] + 100) << 0x20;   (%i1 is the zero byte the loop exits on)
+        zero_after -O2: sub_20080(a1,a0); return a1;                   (the literal 0 folded away)
+        one_after -O2:  if (1 <= a0) return 1; return a1;             (same, on one path)
+        mark -O0:       return (uint8)(a1 + 1) << 0x20;              (mov %g0,%i1 zeroes a byte store)
+
+    zero_after and one_after also pass the argument to a call, whose pcode
+    keeps a RETURN for a delay-slot restore that the constant didrestore = 0
+    never reaches.
+
+    Assert #1: wide_mul is the signed 64-bit product, rd %y (the high word) in %o0.
+    Asserts #2-#3, #5: same and keep_zero return one int in %o0, and return 0.
+    Assert #4: no function returns the second argument shifted into the high word.
+    Asserts #6-#9: back4, mark, zero_after and one_after return one int in %o0,
+    never the second argument, and nothing is shifted into the high word.
+-->
+<bytechunk space="ram" offset="0x10000" readonly="true">
+9de3bfa0b25e4018b140000081c7e00881e800009de3bfa0b2866001b0c62000
+81c7e00881e800009de3bfa04000000090100018b2826007b0c2200081c7e008
+81e800009de3bfa0b25e2003b140000081c7e00881e800009de3bfa080a60019
+028000040100000081c7e00891e8000081c7e00891e820019de3bfa0b4100000
+f226000081c7e00891e8001a
+</bytechunk>
+<symbol space="ram" offset="0x10000" name="wide_mul"/>
+<symbol space="ram" offset="0x10058" name="same"/>
+<symbol space="ram" offset="0x10078" name="keep_zero"/>
+<bytechunk space="ram" offset="0x20000" readonly="true">
+9de3bfa0b4100000f42e0019b2066001f42e000081c7e00891e800199de3bfa0
+10800003b0063ffeb0063ffff20e200180a6600012bffffd01000000f20e0000
+80a6600012bffff901000000f20e3fff80a6600012bffff501000000f20e3ffe
+80a6600012bffff101000000f04e3ffd81c7e00891ee20649de3bfa090100019
+400000009210001881c7e00891e800009de3bfa0901000194000000092100018
+80a62000148000040100000081c7e00891e8000081c7e00891e82001
+</bytechunk>
+<symbol space="ram" offset="0x2001c" name="back4"/>
+<symbol space="ram" offset="0x20078" name="zero_after"/>
+<symbol space="ram" offset="0x20090" name="one_after"/>
+<bytechunk space="ram" offset="0x30000" readonly="true">
+9de3bf98f027bffcf227bff8f007bffcf407bff8b2100000f22e001af007bffc
+f22e0000f007bff881c7e00891ee2001
+</bytechunk>
+<symbol space="ram" offset="0x30000" name="mark"/>
+</binaryimage>
+<script>
+  <com>lo fu wide_mul</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu same</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu keep_zero</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu back4</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu zero_after</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu one_after</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu mark</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>quit</com>
+</script>
+<stringmatch name="bejoin-sparc #1: wide_mul returns the 64-bit product, high word in o0" min="1" max="1">return \(int8\)a1 \* a0;</stringmatch>
+<stringmatch name="bejoin-sparc #2: same returns one int in o0" min="1" max="1">unsigned int same\(</stringmatch>
+<stringmatch name="bejoin-sparc #3: keep_zero returns one int in o0" min="1" max="1">unsigned int keep_zero\(</stringmatch>
+<stringmatch name="bejoin-sparc #5: same, keep_zero, zero_after and one_after return 0, not the second argument" min="4" max="4">return 0;</stringmatch>
+<stringmatch name="bejoin-sparc #4: nothing returns the second argument shifted into the high word" min="0" max="0">a1 &lt;&lt; 0x20</stringmatch>
+<stringmatch name="bejoin-sparc #6: back4 and mark return one int in o0" min="2" max="2">int4 (back4|mark)\(</stringmatch>
+<stringmatch name="bejoin-sparc #7: zero_after and one_after return one int in o0" min="2" max="2">unsigned int (zero_after|one_after)\(</stringmatch>
+<stringmatch name="bejoin-sparc #8: no function returns the second argument" min="0" max="0">return a1;</stringmatch>
+<stringmatch name="bejoin-sparc #9: nothing is shifted into the high word" min="0" max="0">&lt;&lt; 0x20</stringmatch>
+</decompilertest>

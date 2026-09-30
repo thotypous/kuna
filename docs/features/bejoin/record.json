@@ -1,0 +1,71 @@
+{
+ "opportunity": "On every big-endian 32-bit ABI a two-register value comes back with the HIGH word in the first register (PowerPC r3, MIPS o32 $2, SPARC %o0, ARM BE r0; AArch64 BE x0 for __int128), and AVR's gcc ABI returns an int with the high byte in R25, the first register of its reversesignif join rule. Return recovery and the call-output pair joined that register as the low half, so clang -O2 `long long wide_mul(int,int)` printed `CONCAT44(a1 * a0,(int)(... >> 0x20))` on PowerPC, MIPS, SPARC and ARM big-endian, and AVR `int negate(int)` printed `CONCAT11(a1,a0)`.",
+ "test_name": "tests/stages/kuna-bejoin.xml (PowerPC, 5 asserts, 0/5 on main) + tests/stages/kuna-bejoin-sparc.xml (SPARC leftovers, 9 asserts, 2/9 on main) + tests/stages/kuna-bejoin-sparc64.xml (SPARC low words returned on purpose, 10 asserts, 4/10 on main, 1/10 with the version before this one) + tests/stages/kuna-bejoin-avr.xml (AVR, 5 asserts, 2/5 on main) + kuna-cli/tests/decompile_all_cli.rs a_big_endian_register_pair_round_trips_through_the_printed_c, an_argument_carried_across_a_call_into_the_low_word_is_returned, an_avr_register_pair_joins_high_byte_first_as_a_value, a_register_window_leftover_is_not_the_low_word, a_low_word_a_sparc_function_returns_on_purpose_is_part_of_the_value + kuna_rustabi/tests.rs a_most_significant_first_pair_joins_the_first_register_high + kuna_returnuncomputed/tests.rs (window walk: entry value, scratch literal, deliberate literal and value, used value, -1 in both registers, a literal copied or ORed into the first register, a sign-extended literal, a (0,0) path beside a computed pair, a zero-extended byte in both registers, heritage pieces; literals built in steps, zero low word, the late repair's shapes, decided conditions, never-reached RETURNs) + funcdata_varnode tests a_cleared_dead_input_leaves_its_high_variable",
+ "binary": "decompiler/crates/kuna-analysis/tests/fixtures/bejoin_{ppc32,arm32,sparc32,mips32}_be.o and bejoin_{ppc32,arm32}_le.o built from bejoin.c; bejoin_carry_arm32_{be,le}.o built from bejoin_carry.c; bejoin_avr.bin (raw .text of bejoin_avr.c); bejoin_window_sparc32_O{0,2}.o built from bejoin_window.c; bejoin_window64_sparc32_O{0,2}.o built from bejoin_window64.c (bejoin_window.c now also has sum_or)",
+ "selector": "wide_mul",
+ "func_addr": "0x0 (every fixture)",
+ "option": null,
+ "flag": null,
+ "change_kind": "strict correctness fix (no option: it only changes register-pair returns and call outputs whose output rule joins the first register high -- every big-endian target, and AVR's gcc spec through reversesignif; every other target is byte-identical)",
+ "tier": "core",
+ "source_decompiler": "kuna",
+ "inspiration": "upstream FuncCallSpecs::buildOutputFromTrials reads ParamActive::isJoinReverse; ActionReturnRecovery::buildReturnOutput does not",
+ "default_on": true,
+ "ablation_changed": 0,
+ "parity": "OK",
+ "root_cause": "buildReturnOutput and kuna_rustabi::build_call_output_pair took trial 0 (the first register in storage order) as the low half. The <join/> output rule records whether it consumed the most significant piece first (MultiSlotAssign::consumeMostSig -> ParamActive::setJoinReverse): by default on a big-endian register space, and flipped by reversesignif (AVR's gcc spec, little-endian, sets it), and nothing read it at the return. With the halves in the rule's order, more defects showed. SPARC's restore copies %i1 back to %o1 on every return, so %o1 reaches the RETURN holding whatever the function left in %i1 (the incoming argument, clang -O0's scratch zero, an unrelocated sethi pair, or a value zero at the exit), and the rule pool folds a zero half out of the join (PIECE(ZEXT(x),y) -> ZEXT(PIECE(x,y)), PIECE(0,y) -> ZEXT(y), PIECE(x,0) -> ZEXT(x) << 32) before the uncomputed-half repair runs; the swapped order had narrowed many of these to %o0 by accident. SPARC's call pcode also keeps a RETURN for a delay-slot restore that didrestore = 0 never reaches, where %o1 is the call's argument. And AVR maps its registers into data memory, so the contiguous pair's parent register R25R24 is a global that merged with the argument bytes and printed as `return R25R24;`.",
+ "fix": "ParamActive::join_pair_order decides which trial is the low half; build_return_output and build_call_output_pair use it. kuna_rustabi::pair_join_address keeps a join record when the contiguous pair's parent register is global storage (AVR). After the join every decision reads the order back from storage: kuna_returnuncomputed::first_register_holds_high (the high half sits in the earlier model output entry, ParamListStandard::holds_high_first), used by the late repair (look through ZEXT(PIECE(x,lo)), first-in-class tie-break, one-register guard) and holds_scalar_pair. classify_window_pair (return recovery, pair joined first register high, kept on Funcdata::kuna_window_pair): HandedBack when a register-window move (moves_register_window: one instruction copying every general-purpose argument register, SPARC save/restore, either end possibly a heritage temporary) defines the second register at every live RETURN; Leftover when it also holds its entry value or a literal (built_from_literals) there through copies/indirects/phis, every register-moving copy a window's; RETURNs behind branches literals decide the other way are skipped (never_reached). The pair is always built. zero_leftover_low_half (right after the join and at the start of every later pass): a Leftover's PIECE low input becomes zero where the high input is zero, so PIECE(0, a1) folds into a literal instead of ZEXT(a1). The late repair keeps a Leftover pair's first register from the PIECE (a literal second register counts as leftover), and for any window pair reads ZEXT(x) << lo (shifted_high_half: keep x) and a literal (literal_pair: keep a new constant of its high half, stored in the first register, window_high_storage). narrow_window_pair (every pass) gives each RETURN SUBPIECE(whole, lo) in the first register only when some RETURN has a shape the late repair does not read (late_strippable) and the register is a Leftover or the low half is zero at every RETURN (low_bits_zero). The first version asked only for the entry value and printed ARM BE `unsigned long long f(unsigned a,unsigned b){ext();return b;}` (mov r4,r1; bl ext; mov r1,r4) as `return 0`; the second dropped only the untouched argument and turned 49 functions main printed narrow (by accident) into `x << 32`; three intermediate versions of this round narrowed during the main loop more widely or zeroed every leftover, which made a single %o0 return one variable with the first argument through SPARC's unrelocated calls (SQLite `a0 = (struct_100 *)0x1; return a0;`, +192 `a0 =` lines) or typed GH-6990's return uint4 Round 4 (review: a restore destination write counted as the window's, and every literal in %i1 as scratch): moves_register_window accepts only a COPY of one register into another (the register possibly a heritage PIECE of its pieces), so `restore %g0,1,%o1` (tmp = 0 + 1; %o1 = tmp) is the function's own write (WindowPair::No). window_values walks %i1 back through window copies, phis and indirects, then PIECE/SUBPIECE, to entry values, literals and values; a literal that reaches the first register's slot (unchanged, or through any op but a sign extension) unless all ones, and a computed value copied unchanged there with its top bit clear, are set aside; a RETURN with every path set aside holds a leftover; the rest are followed forward: reaching only RETURNs is deliberate (No), a literal reaching a store/call/branch/load address is a leftover, a used value is handed back. Any deliberate RETURN -> No; else any leftover -> Leftover; else HandedBack. The late repair repairs a window pair at every live RETURN or none and repoints every RETURN before destroying concatenations. clear_dead_varnodes now takes a freed Varnode out of its HighVariable (C++ ~Varnode): with a window pair repaired at every RETURN, an input left unread after merging stayed in its variable and the naming pass read it (SQLite replaceFunc panicked).",
+ "abi_evidence": {
+  "powerpc_svr4": "clang -O2 wide_mul: mulhw 5,4,3; mullw 4,4,3; mr 3,5 (high word in r3)",
+  "mips_o32_be": "gcc/clang -O2: mult $5,$4; mfhi $2; mflo $3 (high word in $2)",
+  "sparc_v8": "clang -O2: smul %i1,%i0,%i1; rd %y,%i0 (%y = high word -> %o0)",
+  "arm_aapcs_be": "clang -O2: smull r2,r3,r1,r0; mov r0,r3; mov r1,r2 (RdHi -> r0)",
+  "aarch64_be": "__int128: smulh x8,x1,x0; mul x1,x1,x0; mov x0,x8 (high -> x0)",
+  "m68k": "68000.cspec names D0:D1 in one join entry; trials sort by justified offset: already right, unchanged",
+  "parameters": "two-register parameters are never joined (ActionParamDouble is a no-op): printed as two arguments in ABI order, unchanged"
+ },
+ "roundtrip": {
+  "method": "decompile-all the fixtures, compile the printed functions with gcc and clang at -O0 and -O2 against a driver computing the source's arithmetic (cross-built objects cannot run here; the source stands in for the binary; arguments in ABI register order)",
+  "main": "bejoin_*.o mismatches per function (gcc -O0): PPC/ARM/SPARC/MIPS BE wide_mul 79/100, add_one 5/6, triple 9/10, triple_plus 10/10; SPARC keep_zero 9/10; LE controls 0. bejoin_carry_arm32_be.o 184 mismatches (every carry_b/carry_if/carry_low printed as a1 << 32), LE control 0. bejoin_avr.bin 22/24 (bytes swapped). bejoin_window_sparc32_O{0,2}.o: zero_after 9/10 and one_after 5/10 (return 0 printed as the argument)",
+  "first_version": "bejoin_*.o 0; bejoin_carry_arm32_be.o does not compile (carry_b(void) { ext(); return 0; }); bejoin_avr.bin does not compile (return R25R24;)",
+  "fix": "0 mismatches on every fixture, compiler and level; the ARM LE control prints `return a1;`",
+  "second_version": "bejoin_window_sparc32_O0.o mark 8/8, zero_after 9/10; bejoin_window_sparc32_O2.o back4 24/24, zero_after 9/10, one_after 5/10 (the value returned in the high word, or the argument for return 0)",
+  "round4": "bejoin_window64_sparc32_O{0,2}.o (neg_one, k_one, status64, bool64, sel_const, mix2, mix3), mismatches per function (gcc -O0; same for clang and -O2): main -O0/-O2 k_one 1, status64 9/10, bool64 10/100, sel_const 10/10, mix2 90/100, mix3 99/100, neg_one 0; version before this one -O0 neg_one 1, k_one 1; -O2 neg_one 1, k_one 1, status64 9, bool64 10, mix2 81, mix3 90, and sel_const printed without its argument; now 0 everywhere, neg_one's text identical to main at -O0 and -O2. bejoin_window_sparc32_O2.o sum_or: main 1, version before 5, now 0. The reviewer's lit.c/wide.c/mixr.c at SPARC -O0/-O2: main 104/72/393 (-O2) -> now only k_b (the untouched second argument returned as the low word: byte-identical to an int function returning 0, #770), mask_bits and key (unrelocated calls; same on main)"
+ },
+ "corpus_diff": {
+  "method": "kuna decompile-all origin/main ea7f6597a vs this change (b1e54ab81 code) on the big-endian set (235 files / 16,247 functions), the disjoint bzip2+zlib set (209 objects), and a reviewer Lua 5.3 set (80 objects, 1,334 functions with DWARF return types); return widths checked against DWARF from the same sources built with -g for an ILP32 target (SQLite 3.50, zlib 1.3.1, bzip2)",
+  "little_endian": "45 x86-64 castbench binaries: all .c files byte-identical to origin/main; PowerPC LE, MIPSel and ARM LE objects in the big-endian set: 0 changed functions",
+  "big_endian_set": "1,640 changed: non-SPARC 361 (the same functions as the version before this one: pairs in ABI order, call-output pairs on PowerPC/MIPS/ARM BE); SPARC 1,279. Headers vs main: 627 narrow->narrow, 403 wide->narrow, 590 wide->wide, 20 narrow->wide. The same 3 functions fail to decompile on main and here",
+  "vs_previous_version": "336 functions differ, all SPARC",
+  "dwarf_widths_sparc": "printed return width equal to the source's, main / version before this one / now: SQLite 236 / 376 / 439 of 1,188 (67 fixed, 4 broken against the version before: sqlite3_bind_int, sqlite3VdbeIdxRowid, changeTempStorage hand back a computed, used %i1 at every RETURN and keep the pair; sqlite3UpsertAnalyzeTarget loads %i0:%i1 with one ldd); zlib 39 / 50 / 53 of 107; bzip2+zlib -O0/-O2 51 / 62 / 68 of 198; Lua vs main 31 improve, 3 regress (lua_load, str_rep, codepoint: a computed, used %i1 at every RETURN; main was narrow only because its per-RETURN repair narrowed the first RETURN and kept the pair at others). luaV_mod (lua_Integer) stays 64-bit",
+  "disjoint_set": "215 changed vs main (SPARC 201, AVR 9, ARM BE 4, MIPS 1), no new decompile failures",
+  "ambiguous_left": "an untouched second argument returned as the low word (#770); a computed %i1 the function also used at every RETURN (int scale(int *p,int k)); a value only used to compute %o0 (a partial sum): all print a pair, as on main"
+ },
+ "benchmark": {
+  "typesweep": "444 slices (finalsweep, metric pinned db625): per-slice rows identical to origin/main ea7f6597a in 444/444",
+  "castbench": "4,815 shared functions, all 45 .c files byte-identical to origin/main ea7f6597a: 32,075 casts (0.848x IDA; the 632437155 arm has 32,073 from main's own later commits), 27.0 per 100 statements",
+  "arity_phantom": "x86-64 variables[] identical in all 444 slices; SPARC sel_const keeps its int parameter in variables[] (the version before dropped it)"
+ },
+ "speed": {
+  "method": "docs/features/bejoin/speed.py: decompile-all --json on O2 fmt/ls/sort/bash, origin/main ea7f6597a vs this change (b1e54ab81 code) as release binaries, interleaved and order-alternated, one warm-up per arm, min and median-of-ratios of 15 (samples in speed.json), at a quiet moment",
+  "budget_pct": 5.0,
+  "note": "the window classification runs only for a SPARC-style register-window pair; x86-64 output is byte-identical",
+  "fmt": [
+   0.46,
+   0.77
+  ],
+  "ls": [
+   0.74,
+   0.83
+  ],
+  "sort": [
+   0.71,
+   0.71
+  ],
+  "bash": [
+   0.55,
+   0.55
+  ],
+  "values": "[delta_min_pct, delta_median_of_ratios_pct]; 1/5/15-minute loads: fmt 1.4/4.6/5.5, ls 1.1/2.0/3.9, sort 1.2/1.3/2.8, bash 1.9/1.5/1.5"
+ }
+}

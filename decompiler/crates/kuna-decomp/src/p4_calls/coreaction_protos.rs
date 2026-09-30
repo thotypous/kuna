@@ -1441,17 +1441,16 @@ impl ActionReturnRecovery {
             // whose low/high 4-byte lanes split during heritage refinement).
             // Build PIECE(hi,lo) at the JOIN/parent-register address so the
             // RETURN reads one whole varnode.
-            let lovn = newparam[1];
-            let hivn = newparam[2];
+            let (lo, hi) = active.join_pair_order();
+            let lovn = newparam[1 + lo as usize];
+            let hivn = newparam[1 + hi as usize];
             let (lo_addr, lo_size) =
-                (active.get_trial(0).get_address().clone(), active.get_trial(0).get_size());
+                (active.get_trial(lo).get_address().clone(), active.get_trial(lo).get_size());
             let (hi_addr, hi_size) =
-                (active.get_trial(1).get_address().clone(), active.get_trial(1).get_size());
-            let manage = data.get_arch().manage.clone();
-            let join = manage.register_lookup().and_then(|rl| {
-                manage
-                    .construct_join_address(rl.as_ref(), &hi_addr, hi_size, &lo_addr, lo_size)
-                    .ok()
+                (active.get_trial(hi).get_address().clone(), active.get_trial(hi).get_size());
+            let retaddr = data.obank().get(retop).map(|o| o.get_addr().clone());
+            let join = retaddr.as_ref().and_then(|at| {
+                crate::kuna_rustabi::pair_join_address(data, &hi_addr, hi_size, &lo_addr, lo_size, at)
             });
             match join {
                 Some(joinaddr) => {
@@ -1575,7 +1574,15 @@ impl Action for ActionReturnRecovery {
         // checked) rewrite the RETURN ops to carry the recovered return value.
         let mut active = match data.take_active_output() {
             Some(a) => a,
-            None => return 0,
+            None => {
+                if crate::kuna_returnuncomputed::zero_leftover_low_half(data) {
+                    self.base.count += 1;
+                }
+                if crate::kuna_returnuncomputed::narrow_window_pair(data) {
+                    self.base.count += 1;
+                }
+                return 0;
+            }
         };
         let maxancestor = data.get_arch().trim_recurse_max;
         let cond_exe_ret = data.get_arch().cond_exe_ret;
@@ -1668,6 +1675,8 @@ impl Action for ActionReturnRecovery {
             crate::kuna_armfloatreturn::narrow_returns(data, &mut active);
             let manager_rc = data.get_arch().manage.clone();
             let _ = data.get_func_proto().derive_output_map(&mut active, &manager_rc);
+            let window_pair = crate::kuna_returnuncomputed::classify_window_pair(&active, data, &return_ops);
+            data.kuna_set_window_pair(window_pair);
             let return_single = data.get_arch().return_single;
             for &op in &return_ops {
                 let o = match data.obank().get(op) {
@@ -1680,6 +1689,7 @@ impl Action for ActionReturnRecovery {
                 Self::build_return_output(&active, op, data, return_single);
             }
             crate::kuna_armfloatreturn::type_returns(data, &active);
+            crate::kuna_returnuncomputed::zero_leftover_low_half(data);
             data.clear_active_output();
             self.base.count += 1;
         } else {
@@ -2025,6 +2035,7 @@ impl Action for ActionOutputPrototype {
         // `v[8] = <uninitialized stack slot>` — output that reads memory the
         // function never wrote. Here, unlike at recovery time, heritage has
         // finished and the leftover half is plainly an unwritten Varnode.
+        let window_high = crate::kuna_returnuncomputed::window_high_storage(data);
         crate::kuna_returnuncomputed::strip_uncomputed_return_piece(data);
         let retop = match data.get_first_return_op() {
             Some(op) => op,
@@ -2043,7 +2054,13 @@ impl Action for ActionOutputPrototype {
             Some(vn) => vn,
             None => return 0, // empty trial list: leave output void
         };
-        let out_addr = data.vbank().get(trial0).expect("outputprototype: stale trial").get_addr().clone();
+        let out_addr = {
+            let v = data.vbank().get(trial0).expect("outputprototype: stale trial");
+            match window_high {
+                Some(high) if v.is_constant() => high,
+                _ => v.get_addr().clone(),
+            }
+        };
         // pieces.type = triallist[0]->getHigh()->getType()  (high-on path).
         let out_type = data
             .high_get_type(trial0)

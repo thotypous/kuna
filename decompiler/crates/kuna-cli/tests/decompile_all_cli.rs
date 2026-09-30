@@ -7008,3 +7008,375 @@ int main(void) {
         }
     }
 }
+
+/// A 64-bit value a 32-bit ABI returns in two registers joins with the high
+/// word where the ABI puts it. Every big-endian ABI here returns the high word
+/// in the FIRST register (PowerPC r3, MIPS o32 `$2`, SPARC `%o0`, ARM r0), and
+/// return recovery and the call-output pair joined that register as the LOW
+/// word, so `wide_mul` printed `CONCAT44(low, high)` and returned the two halves
+/// swapped. `same` and `keep_zero` return one register; SPARC's `restore` also
+/// hands the second argument back in `%o1`, which printed both as `long long`
+/// returning that argument shifted into the high word. `bejoin.c`'s big-endian
+/// builds and two little-endian controls are printed, every function is
+/// compiled with gcc and clang at -O0 and -O2, and each is run against the
+/// source's own arithmetic: the cross-built objects cannot run on this host, so
+/// the source stands in for the binary. The arguments of `add_one` go in the
+/// ABI's register order: high word first on a big-endian target. MIPS
+/// `add_one` and `triple_plus`, and SPARC `triple_plus`, are left out: kuna
+/// drops a half of the first (on either endianness) and cannot follow the
+/// second's unrelocated call.
+#[test]
+fn a_big_endian_register_pair_round_trips_through_the_printed_c() {
+    const ALL: &[&str] = &["wide_mul", "add_one", "triple", "triple_plus", "same", "keep_zero"];
+    let cases: [(&str, bool, &[&str]); 6] = [
+        ("bejoin_ppc32_be.o", true, ALL),
+        ("bejoin_arm32_be.o", true, ALL),
+        ("bejoin_sparc32_be.o", true, &["wide_mul", "add_one", "triple", "same", "keep_zero"]),
+        ("bejoin_mips32_be.o", true, &["wide_mul", "triple", "same", "keep_zero"]),
+        ("bejoin_ppc32_le.o", false, ALL),
+        ("bejoin_arm32_le.o", false, ALL),
+    ];
+    let sp = specs();
+    for (fixture, big_endian, funcs) in cases {
+        let bin = repo_root()
+            .join("decompiler/crates/kuna-analysis/tests/fixtures")
+            .join(fixture)
+            .to_str()
+            .unwrap()
+            .to_string();
+        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+        assert!(ok, "kuna decompile-all {fixture} failed: {stderr}");
+        let printed = callrettype_functions(&stdout, funcs);
+        let decls: String = printed
+            .split("// Function: ")
+            .skip(1)
+            .filter_map(|part| part.lines().nth(1))
+            .map(|sig| format!("{sig};\n"))
+            .collect();
+        let mut checks = String::from("  for (int i = 0; i < 10; i++)\n    for (int j = 0; j < 10; j++)\n");
+        checks.push_str("      bad += (unsigned long long)wide_mul(xs[i], xs[j]) != (unsigned long long)((long long)xs[i] * xs[j]);\n");
+        checks.push_str("  for (int i = 0; i < 10; i++) {\n");
+        checks.push_str("    bad += (unsigned long long)triple(xs[i]) != (unsigned long long)((long long)xs[i] * 3);\n");
+        if funcs.contains(&"triple_plus") {
+            checks.push_str("    bad += (unsigned long long)triple_plus(xs[i]) != (unsigned long long)((long long)xs[i] * 3 + 7);\n");
+        }
+        checks.push_str("  }\n");
+        checks.push_str("  for (int i = 0; i < 10; i++) {\n    int cell = 0;\n");
+        checks.push_str("    bad += keep_zero((void *)&cell, xs[i]) != 0 || cell != xs[i];\n");
+        checks.push_str("    for (int j = 0; j < 10; j++)\n");
+        checks.push_str("      bad += (unsigned int)same(xs[i], xs[j]) != (unsigned int)(xs[i] == xs[j]);\n  }\n");
+        if funcs.contains(&"add_one") {
+            let (first, second) = if big_endian { ("hi", "lo") } else { ("lo", "hi") };
+            checks.push_str(&format!(
+                "  for (int i = 0; i < 6; i++) {{\n    int hi = (int)(vs[i] >> 32); unsigned int lo = (unsigned int)vs[i];\n    \
+                 bad += (unsigned long long)add_one({first}, {second}) != (unsigned long long)(vs[i] + 1);\n  }}\n"
+            ));
+        }
+        let src_text = format!(
+            "#include <stdbool.h>\n#include <stdio.h>\n\
+             #define CONCAT44(h, l) ((unsigned long long)(unsigned int)(h) << 32 | (unsigned int)(l))\n\
+             {decls}{printed}\n\
+             int main(void) {{\n  static const int xs[10] = {{0, 1, -1, 7, -7, 0x7fffffff, (int)0x80000000, 0x55555553, -0x55555553, 123456789}};\n  \
+             static const long long vs[6] = {{0, 0xffffffffLL, -1, 0x7ffffffffffffffeLL, -0x100000000LL, 0x12345678ffffffffLL}};\n  \
+             int bad = 0;\n{checks}  printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
+        );
+        bejoin_round_trip(fixture, &src_text, &printed);
+    }
+}
+
+/// Compile `src_text` -- the printed functions `printed` and a `main` that
+/// prints how many of its checks disagree with the source -- with gcc and clang
+/// at -O0 and -O2, run it, and require `0`. The cross-built objects cannot run
+/// on this host, so the source's own arithmetic stands in for the binary.
+fn bejoin_round_trip(label: &str, src_text: &str, printed: &str) {
+    let compilers: Vec<&str> = ["gcc", "clang"]
+        .into_iter()
+        .filter(|cc| process::optional_output(Command::new(cc).arg("--version")).is_some())
+        .collect();
+    for cc in &compilers {
+        for level in ["-O0", "-O2"] {
+            let dir = std::env::temp_dir().join(format!("kuna-bejoin-rt-{}-{label}-{cc}{level}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("rt.c");
+            let exe = dir.join("rt");
+            std::fs::write(&src, src_text).unwrap();
+            let out = Command::new(cc)
+                .args(["-std=gnu11", "-w", "-Wno-error=int-conversion", level])
+                .args(["-o", exe.to_str().unwrap(), src.to_str().unwrap()])
+                .output()
+                .expect("spawn the C compiler");
+            assert!(
+                out.status.success(),
+                "{cc} {level} rejected the printed C ({label}):\n{}\n{src_text}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let run = process::required_output(&mut Command::new(&exe));
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout),
+                "0\n",
+                "{label} printed and built by {cc} {level} computes a different value:\n{printed}"
+            );
+        }
+    }
+}
+
+/// How many parameters the printed header `sig` declares.
+fn bejoin_arity(sig: &str) -> usize {
+    let inner = sig.split_once('(').and_then(|(_, rest)| rest.rsplit_once(')')).map(|(p, _)| p.trim()).unwrap_or("");
+    if inner.is_empty() || inner == "void" {
+        0
+    } else {
+        inner.split(',').count()
+    }
+}
+
+/// A big-endian ARM ABI returns a `long long` in r0:r1 with the high word in r0,
+/// and r1 is also where the second argument arrives. `bejoin_carry.c` carries
+/// that argument across a call into the low word (`mov r4,r1; bl ext; mov r0,#0;
+/// mov r1,r4`): a return value, written by a move the compiler chose. It has
+/// the data flow of SPARC's register-window restore, which hands `%o1` back
+/// unchanged on every function that opened a window and is not a return value,
+/// so a drop meant for the window printed these as `return 0`. The
+/// little-endian build is the control and returns the argument in r0 as `a1`.
+/// Every function is compiled with gcc and clang at -O0 and -O2 and run against
+/// the source; `carry_low`'s argument goes in the ABI's register order.
+#[test]
+fn an_argument_carried_across_a_call_into_the_low_word_is_returned() {
+    let sp = specs();
+    for (fixture, big_endian) in [("bejoin_carry_arm32_be.o", true), ("bejoin_carry_arm32_le.o", false)] {
+        let bin = repo_root()
+            .join("decompiler/crates/kuna-analysis/tests/fixtures")
+            .join(fixture)
+            .to_str()
+            .unwrap()
+            .to_string();
+        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+        assert!(ok, "kuna decompile-all {fixture} failed: {stderr}");
+        let printed = callrettype_functions(&stdout, &["carry_b", "carry_if", "carry_low"]);
+        let sigs: Vec<&str> = printed.split("// Function: ").skip(1).filter_map(|part| part.lines().nth(1)).collect();
+        assert_eq!(sigs.len(), 3, "{fixture}: all three functions print:\n{stdout}");
+        if !big_endian {
+            let carry_b = callrettype_functions(&stdout, &["carry_b"]);
+            assert!(carry_b.contains("return a1;"), "the little-endian control returns r1 as it arrived:\n{carry_b}");
+        }
+        let decls: String = sigs.iter().map(|sig| format!("{sig};\n")).collect();
+        let low_arity = sigs.iter().find(|s| s.contains("carry_low(")).map(|s| bejoin_arity(s)).unwrap_or(0);
+        let words = if big_endian { ["hi", "lo"] } else { ["lo", "hi"] };
+        let low_args = words[..low_arity.min(2)].join(", ");
+        let src_text = format!(
+            "#include <stdio.h>\n\
+             void ext(void) {{}}\n\
+             {decls}{printed}\n\
+             int main(void) {{\n  static const int xs[10] = {{0, 1, -1, 7, -7, 0x7fffffff, (int)0x80000000, 0x55555553, -0x55555553, 123456789}};\n  \
+             static const long long vs[6] = {{0, 0xffffffffLL, -1, 0x7ffffffffffffffeLL, -0x100000000LL, 0x12345678ffffffffLL}};\n  \
+             int bad = 0;\n  \
+             for (int i = 0; i < 10; i++)\n    for (int j = 0; j < 10; j++) {{\n      \
+             bad += (unsigned long long)carry_b(xs[i], xs[j]) != (unsigned long long)(unsigned int)xs[j];\n      \
+             bad += (unsigned long long)carry_if(xs[i], xs[j]) != (unsigned long long)(unsigned int)xs[j];\n    }}\n  \
+             for (int i = 0; i < 6; i++) {{\n    unsigned int hi = (unsigned int)(vs[i] >> 32), lo = (unsigned int)vs[i];\n    \
+             (void)hi;\n    bad += (unsigned long long)carry_low({low_args}) != (unsigned long long)lo;\n  }}\n  \
+             printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
+        );
+        bejoin_round_trip(fixture, &src_text, &printed);
+    }
+}
+
+/// AVR's gcc ABI returns an `int` in R25:R24 with the high byte in R25, the
+/// first register its `<join reversesignif="true">` rule consumes, although the
+/// target is little-endian. The pair joined R25 as the low byte, so `negate`
+/// printed `CONCAT11(a1,a0)`. With the order right, the two registers are
+/// contiguous and name `R25R24` -- a global, since AVR maps its register file
+/// into data memory -- and a value built there printed as `return R25R24;`, a
+/// read of a register the printed C never assigns. `bejoin_avr.bin` is the raw
+/// `.text` of `bejoin_avr.c`; both functions are compiled with gcc and clang at
+/// -O0 and -O2 against the source's 16-bit arithmetic, the arguments in ABI
+/// register order (R25, the high byte, first). The printed C writes the zero
+/// register `R1`, which the driver declares.
+#[test]
+fn an_avr_register_pair_joins_high_byte_first_as_a_value() {
+    let bin = repo_root()
+        .join("decompiler/crates/kuna-analysis/tests/fixtures/bejoin_avr.bin")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let sp = specs();
+    let (stdout, stderr, ok) = run_kuna(&[
+        "decompile-all",
+        &bin,
+        "--raw-image",
+        "--target",
+        "avr8:LE:16:default:gcc",
+        "--base",
+        "0",
+        "--addr",
+        "0x0",
+        "--addr",
+        "0x4",
+        "--sleighpath",
+        &sp,
+    ]);
+    assert!(ok, "kuna decompile-all bejoin_avr.bin failed: {stderr}");
+    let printed = callrettype_functions(&stdout, &["sub_0", "sub_4"]);
+    let sigs: Vec<&str> = printed.split("// Function: ").skip(1).filter_map(|part| part.lines().nth(1)).collect();
+    assert_eq!(sigs.len(), 2, "both functions print:\n{stdout}");
+    assert!(!printed.contains("return R25R24;"), "the pair is a value, not the global register:\n{printed}");
+    let decls: String = sigs.iter().map(|sig| format!("{sig};\n")).collect();
+    let src_text = format!(
+        "#include <stdbool.h>\n#include <stdio.h>\n\
+         char R1;\n\
+         #define CONCAT11(h, l) ((unsigned short)((unsigned char)(h) << 8 | (unsigned char)(l)))\n\
+         {decls}{printed}\n\
+         int main(void) {{\n  static const int xs[12] = {{0, 1, -1, 0x7f, 0x80, 0xff, 0x100, 0x1234, 0x7fff, -0x8000, -2, 0x55aa}};\n  \
+         int bad = 0;\n  \
+         for (int i = 0; i < 12; i++) {{\n    unsigned short x = (unsigned short)xs[i];\n    \
+         bad += (unsigned short)sub_0((char)(x >> 8), (char)x) != (unsigned short)(0u - x);\n    \
+         bad += (unsigned short)sub_4((char)(x >> 8), (unsigned char)x) != (unsigned short)(x + 0x1234u);\n  }}\n  \
+         printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
+    );
+    bejoin_round_trip("bejoin_avr.bin", &src_text, &printed);
+}
+
+/// SPARC's `restore` hands `%i1` back in `%o1` on every return, so a function
+/// that returns one int in `%o0` also seems to return `%o1`, holding whatever
+/// the function left in `%i1`. With the pair joined in ABI order that leftover
+/// became the low word and the value the high word: `mark` (clang -O0 zeroes
+/// `%i1` to store a byte) and `back4` (its loop exits on the zero byte it last
+/// loaded into `%i1`) printed `return (unsigned long long)x << 0x20;`, and
+/// `zero_after`/`one_after`, which pass the second argument to a call, printed
+/// `return a1;` where the source returns 0. `sum_or` hands back the second
+/// argument on its `return -1` path and the loop counter it counted down in
+/// `%i1` on the other, which printed as a pair. `bejoin_window.c`'s SPARC builds
+/// are printed; the functions that return one register there are compiled
+/// with gcc and clang at -O0 and -O2 and run against the source, called as
+/// `long long` so a value moved into the high word shows. The unrelocated
+/// calls print as `sub_*`, which the driver defines as no-ops.
+#[test]
+fn a_register_window_leftover_is_not_the_low_word() {
+    let sp = specs();
+    let cases: [(&str, &[&str]); 2] = [
+        ("bejoin_window_sparc32_O0.o", &["mark", "zero_after"]),
+        ("bejoin_window_sparc32_O2.o", &["back4", "zero_after", "one_after", "sum_or"]),
+    ];
+    for (fixture, funcs) in cases {
+        let bin = repo_root()
+            .join("decompiler/crates/kuna-analysis/tests/fixtures")
+            .join(fixture)
+            .to_str()
+            .unwrap()
+            .to_string();
+        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+        assert!(ok, "kuna decompile-all {fixture} failed: {stderr}");
+        let printed = callrettype_functions(&stdout, funcs);
+        let sigs: Vec<&str> = printed.split("// Function: ").skip(1).filter_map(|part| part.lines().nth(1)).collect();
+        assert_eq!(sigs.len(), funcs.len(), "{fixture}: every function prints:\n{stdout}");
+        let mut stubs: Vec<&str> = printed
+            .match_indices("sub_")
+            .map(|(at, _)| {
+                let end = printed[at..].find(|c: char| !c.is_ascii_alphanumeric() && c != '_').map_or(printed.len(), |n| at + n);
+                &printed[at..end]
+            })
+            .collect();
+        stubs.sort_unstable();
+        stubs.dedup();
+        let stub_decls: String = stubs.iter().map(|s| format!("void {s}();\n")).collect();
+        let stub_defs: String = stubs.iter().map(|s| format!("void {s}() {{}}\n")).collect();
+        let decls: String = sigs.iter().map(|sig| format!("{sig};\n")).collect();
+        let mut checks = String::new();
+        for f in funcs {
+            checks.push_str(match *f {
+                "mark" => "  for (int n = 0; n < 8; n++) {\n    char buf[8] = \"abcdefg\";\n    \
+                           bad += (long long)mark(buf, n) != (long long)(n + 1) || buf[n] != 0 || buf[0] != 0;\n  }\n",
+                "back4" => "  for (int i = 5; i < 29; i++)\n    bad += (long long)back4(text + i) != (long long)ref_back4(text + i);\n",
+                "zero_after" => "  for (int i = 0; i < 10; i++)\n    bad += (long long)zero_after(xs[i], xs[9 - i]) != 0;\n",
+                "one_after" => "  for (int i = 0; i < 10; i++)\n    bad += (long long)one_after(xs[i], xs[9 - i]) != (long long)(xs[i] > 0);\n",
+                "sum_or" => "  for (int n = 0; n < 5; n++) {\n    int cells[4] = {1, 2, 3, 40};\n    \
+                             bad += (long long)sum_or(cells, n) != (long long)ref_sum_or(cells, n);\n  }\n  \
+                             bad += (long long)sum_or(0, 3) != -1LL;\n",
+                other => panic!("no check for {other}"),
+            });
+        }
+        let src_text = format!(
+            "#include <stdbool.h>\n#include <stdio.h>\n\
+             #define CONCAT44(h, l) ((unsigned long long)(unsigned int)(h) << 32 | (unsigned int)(l))\n\
+             {stub_decls}{decls}{printed}\n{stub_defs}\
+             static int ref_back4(const char *p) {{ while (p[-1] || p[-2] || p[-3] || p[-4]) p--; return p[-5] + 100; }}\n\
+             static int ref_sum_or(int *p, int n) {{ int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }}\n\
+             int main(void) {{\n  static const int xs[10] = {{0, 1, -1, 7, -7, 0x7fffffff, (int)0x80000000, 0x55555553, -0x55555553, 123456789}};\n  \
+             static const char text[29] = {{0, 0, 0, 0, 0, 9, 8, 7, 6, 5, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 11, 12, 13, 14}};\n  \
+             int bad = 0;\n{checks}  printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
+        );
+        bejoin_round_trip(fixture, &src_text, &printed);
+    }
+}
+
+/// SPARC returns a `long long` in `%o0:%o1`, the high word in `%o0`, and each
+/// function in `bejoin_window64.c` puts its low word in `%o1` on purpose:
+/// through `restore`'s destination register (`restore %g0,1,%o1`), or in `%i1`
+/// for `restore` to hand back (`mov 10,%i1`, `mix2`'s product). Taking either
+/// for the window's leftover printed `k_one`, `status64` and `bool64` as
+/// `return 0`, `neg_one` as the 32-bit `0xffffffff`, `mix2`'s shifted return
+/// as the unshifted `a0`, `mix3`'s `0x500000000` as `5`, and dropped
+/// `sel_const`'s argument. Both builds are printed; every function keeps its
+/// source's parameter count and is compiled with gcc and clang at -O0 and -O2
+/// and run against the source, called as `long long`. The unrelocated calls
+/// print as `sub_*`, which the driver defines as returning 0.
+#[test]
+fn a_low_word_a_sparc_function_returns_on_purpose_is_part_of_the_value() {
+    const FUNCS: [(&str, usize); 7] =
+        [("neg_one", 0), ("k_one", 0), ("status64", 1), ("bool64", 2), ("sel_const", 1), ("mix2", 2), ("mix3", 2)];
+    let names: Vec<&str> = FUNCS.iter().map(|(f, _)| *f).collect();
+    let sp = specs();
+    for fixture in ["bejoin_window64_sparc32_O0.o", "bejoin_window64_sparc32_O2.o"] {
+        let bin = repo_root()
+            .join("decompiler/crates/kuna-analysis/tests/fixtures")
+            .join(fixture)
+            .to_str()
+            .unwrap()
+            .to_string();
+        let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+        assert!(ok, "kuna decompile-all {fixture} failed: {stderr}");
+        let printed = callrettype_functions(&stdout, &names);
+        let sigs: Vec<&str> = printed
+            .split("// Function: ")
+            .skip(1)
+            .filter_map(|part| part.lines().nth(1))
+            .map(|sig| sig.split("//").next().unwrap_or("").trim())
+            .collect();
+        assert_eq!(sigs.len(), FUNCS.len(), "{fixture}: every function prints:\n{stdout}");
+        for (f, arity) in FUNCS {
+            let sig = sigs.iter().find(|s| s.contains(&format!(" {f}("))).expect("printed header");
+            assert_eq!(bejoin_arity(sig), arity, "{fixture}: {f} keeps its parameters: {sig}");
+        }
+        let mut stubs: Vec<&str> = printed
+            .match_indices("sub_")
+            .map(|(at, _)| {
+                let end = printed[at..].find(|c: char| !c.is_ascii_alphanumeric() && c != '_').map_or(printed.len(), |n| at + n);
+                &printed[at..end]
+            })
+            .collect();
+        stubs.sort_unstable();
+        stubs.dedup();
+        let stub_decls: String = stubs.iter().map(|s| format!("int {s}();\n")).collect();
+        let stub_defs: String = stubs.iter().map(|s| format!("int {s}() {{ return 0; }}\n")).collect();
+        let decls: String = sigs.iter().map(|sig| format!("{sig};\n")).collect();
+        let src_text = format!(
+            "#include <stdbool.h>\n#include <stdio.h>\n\
+             #define CONCAT44(h, l) ((unsigned long long)(unsigned int)(h) << 32 | (unsigned int)(l))\n\
+             {stub_decls}{decls}{printed}\n{stub_defs}\
+             int main(void) {{\n  static const int xs[10] = {{0, 1, -1, 7, -7, 0x7fffffff, (int)0x80000000, 0x55555553, -0x55555553, 123456789}};\n  \
+             int bad = (long long)neg_one() != -1LL;\n  \
+             bad += (long long)k_one() != 1LL;\n  \
+             for (int i = 0; i < 10; i++) {{\n    \
+             bad += (long long)status64(xs[i]) != (long long)(xs[i] != 0);\n    \
+             bad += (long long)sel_const(xs[i]) != (long long)(xs[i] ? 10 : 20);\n    \
+             for (int j = 0; j < 10; j++) {{\n      \
+             unsigned int x = (unsigned int)xs[i];\n      \
+             bad += (unsigned long long)bool64(xs[i], xs[j]) != (unsigned long long)(xs[i] == xs[j]);\n      \
+             bad += (unsigned long long)mix2(x, xs[j]) != (xs[j] ? (unsigned long long)x << 32 : (unsigned long long)x * 3);\n      \
+             bad += (unsigned long long)mix3(x, xs[j]) != (xs[j] ? 0x500000000ULL : (unsigned long long)x * 3);\n    }}\n  }}\n  \
+             printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
+        );
+        bejoin_round_trip(fixture, &src_text, &printed);
+    }
+}

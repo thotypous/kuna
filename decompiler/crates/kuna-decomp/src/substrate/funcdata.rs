@@ -407,6 +407,10 @@ pub struct Funcdata {
     /// block read the return register, which carries no argument, before it
     /// writes it (`test %al,%al` in a SysV register-save prologue)?
     kuna_passthrough_variadic: bool,
+    /// (kuna) Return recovery joined a register-window pair whose second
+    /// register a window hands back at every RETURN
+    /// ([`crate::kuna_returnuncomputed::narrow_window_pair`]).
+    kuna_window_pair: crate::kuna_returnuncomputed::WindowPair,
     /// (kuna `calleevote`) The types every caller of this function passes for its
     /// inputs, copied off the `Architecture` after the flow build.
     kuna_calleevote_inputs: Option<std::rc::Rc<crate::kuna_calleevote::CallerTypes>>,
@@ -566,6 +570,7 @@ impl Funcdata {
             kuna_passthrough_claims: Vec::new(),
             kuna_passthrough_vararg_calls: Vec::new(),
             kuna_passthrough_variadic: false,
+            kuna_window_pair: crate::kuna_returnuncomputed::WindowPair::No,
             kuna_calleevote_inputs: None,
             kuna_calleevote_closed: false,
             kuna_elemptr_blocked: None,
@@ -1087,6 +1092,18 @@ impl Funcdata {
     /// (kuna `passthrough`) Is this function itself variadic?
     pub fn kuna_passthrough_variadic(&self) -> bool {
         self.kuna_passthrough_variadic
+    }
+
+    /// (kuna) Record whether the recovered output is a register-window pair
+    /// whose second register a window hands back at every RETURN.
+    pub fn kuna_set_window_pair(&mut self, v: crate::kuna_returnuncomputed::WindowPair) {
+        self.kuna_window_pair = v;
+    }
+
+    /// (kuna) Is the recovered output a register-window pair whose second
+    /// register a window hands back at every RETURN?
+    pub fn kuna_window_pair(&self) -> crate::kuna_returnuncomputed::WindowPair {
+        self.kuna_window_pair
     }
 
     /// (kuna `retpushedhalf`) The flow build's record of registers this function
@@ -2903,6 +2920,7 @@ impl Funcdata {
         self.kuna_passthrough_claims.clear();
         self.kuna_passthrough_vararg_calls.clear();
         self.kuna_passthrough_variadic = false;
+        self.kuna_window_pair = crate::kuna_returnuncomputed::WindowPair::No;
     }
 
     /// Set a delay/flag bit directly (test/seam helper; not a C++ method).

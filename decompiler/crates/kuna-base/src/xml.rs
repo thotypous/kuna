@@ -1943,7 +1943,10 @@ mod tests {
         // lies inside the address width
         // and kuna-bit-reinterpret-declared / a float constant stored to a float
         // global stays a float literal and a register move reinterprets once
-        assert_eq!(count, 368, "corpus file count drifted");
+        // and kuna-bejoin + kuna-bejoin-sparc + kuna-bejoin-avr / a two-register
+        // value is joined in the order its rule consumed the registers, and
+        // SPARC's restored %o1 is not part of it
+        assert_eq!(count, 372, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors
