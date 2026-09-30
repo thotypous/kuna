@@ -282,7 +282,8 @@ fn returns_a_call_clobber(data: &Funcdata) -> bool {
 
 /// Does a live RETURN of `data` hand back a value converted from another type:
 /// `return (float)a0[3];` of an `int *`, the float the return register made the
-/// function return arguing with the type its body reads the value as?
+/// function return arguing with the type its body reads the value as?  A cast
+/// of the result of a callee recovered returning a float converts nothing.
 fn converts_its_return(data: &Funcdata) -> bool {
     use kuna_num::opcodes::OpCode;
     let mut work: Vec<crate::context::VarnodeId> = data
@@ -299,7 +300,9 @@ fn converts_its_return(data: &Funcdata) -> bool {
         match def.code() {
             OpCode::CPUI_CAST => {
                 let from = def.get_in(0).and_then(|i| data.vbank().get(i));
-                if from.is_some_and(|i| i.get_type().get_metatype() != crate::dtype::type_metatype::TYPE_FLOAT) {
+                if from.is_some_and(|i| {
+                    i.get_type().get_metatype() != crate::dtype::type_metatype::TYPE_FLOAT && !float_call_result(data, i)
+                }) {
                     return true;
                 }
             }
@@ -309,6 +312,22 @@ fn converts_its_return(data: &Funcdata) -> bool {
         }
     }
     false
+}
+
+/// Is `node` the result of a call whose callee returns a float: a locked float
+/// output, or a float return the callee was last recovered with?
+fn float_call_result(data: &Funcdata, node: &crate::varnode::Varnode) -> bool {
+    use kuna_num::opcodes::OpCode;
+    let Some(d) = node.get_def() else { return false };
+    if !data.obank().get(d).is_some_and(|o| matches!(o.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND)) {
+        return false;
+    }
+    let Some(fc) = data.get_call_specs_index(d).map(|i| data.get_call_specs(i)) else { return false };
+    let proto = fc.proto();
+    if proto.is_output_locked() {
+        return proto.get_output_type().is_some_and(|t| t.get_metatype() == crate::dtype::type_metatype::TYPE_FLOAT);
+    }
+    key(fc.get_entry_address()).is_some_and(|k| data.kuna_callee_returns(k) == Some(Returns::Float))
 }
 
 /// The functions returning a float that a reader keeps as another type, not yet
