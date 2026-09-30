@@ -1,7 +1,7 @@
 {
   "data_footer": [
-    1588,
-    1588
+    1609,
+    1609
   ],
   "passing": [
     "data:ALIASOVERLAP #1: the 4-byte read at a0+7 is a local ahead of a store into it",
@@ -1303,6 +1303,27 @@
     "data:foldcallretphi #7: the call is never printed inside the and-and (pass 4, default)",
     "data:foldcallretphi-join #1: an undeclared call's eax output keeps its spill (pass 1 default, pass 3 off)",
     "data:foldcallretphi-join #2: the call folds into the comparison only once big is declared int4 (pass 2, default)",
+    "data:globalvalue #10: the byte compare does not read the global",
+    "data:globalvalue #11: the value read through + keeps its own variable",
+    "data:globalvalue #12: no value read through + is read back through the global",
+    "data:globalvalue #13: no value read through ^ is read back through the global",
+    "data:globalvalue #14: the joined value is stored from its own variable",
+    "data:globalvalue #15: a short compare a fold rewrote reads the value",
+    "data:globalvalue #16: no short compare reads the global back",
+    "data:globalvalue #17: the load after a pointer store reads the global",
+    "data:globalvalue #18: the register use keeps the value and the load reads the global",
+    "data:globalvalue #19: the load copied to another global reads the global",
+    "data:globalvalue #1: the unsigned value keeps its own variable and cast",
+    "data:globalvalue #20: no load after a pointer store reads the value's variable",
+    "data:globalvalue #21: the range check loads the strtoul result back from the global",
+    "data:globalvalue #2: the unsigned store is not read back through the global",
+    "data:globalvalue #3: the signed value keeps its own variable",
+    "data:globalvalue #4: the signed store is not read back through the global",
+    "data:globalvalue #5: the flipped value is stored where the binary stores it",
+    "data:globalvalue #6: the widening reads the global the binary loads back",
+    "data:globalvalue #7: the conversion reads the value",
+    "data:globalvalue #8: the conversion does not read the global",
+    "data:globalvalue #9: the strtoul result is stored where the binary stores it",
     "data:hideshadow #1: the same value is copied into the variable twice (only pass 1, off)",
     "data:hideshadow #2: the redundant copy is consolidated away (only pass 2, on)",
     "data:hideshadow #3: two copies on exclusive branches are left alone (pass 3, on)",
