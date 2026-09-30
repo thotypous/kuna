@@ -1943,7 +1943,9 @@ mod tests {
         // lies inside the address width
         // and kuna-bit-reinterpret-declared / a float constant stored to a float
         // global stays a float literal and a register move reinterprets once
-        assert_eq!(count, 368, "corpus file count drifted");
+        // and kuna-globalvalue / a value a sign-sensitive op reads keeps its own
+        // variable instead of merging into a global it is stored to
+        assert_eq!(count, 369, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors
