@@ -1502,8 +1502,11 @@ moves.
   width is not fixed by the data model. With `float` and `double` in the
   vocabulary (4- and 8-byte IEEE on every target the tables apply to) the same
   rule admits `strtod`, `strtof`, `sqrt`, `pow`, `ceil`, `log2` and `modf`, and
-  still rejects `strtold` (`long double` has no fixed width) and `strtod_l`
-  (`locale_t`); a float-returning name fewer than three corpus binaries import
+  still rejects `strtold` (`long double` has no fixed width). `strtod_l` is
+  added by hand: its `locale_t` is glibc's `struct __locale_struct *`, a typedef
+  the reduction does not see through, and without it gnulib's `c_strtod`, a tail
+  call to `strtod_l`, returned an integer beside `xstrtod`'s `strtod`, which then
+  converted it by value. A float-returning name fewer than three corpus binaries import
   (`nanf`, `sqrtf`, `fabsf`) stays out, and its import stub is recovered from what
   its callers read instead (chapter 04). The signatures
   themselves are reduced from the platform's own C declarations (`gcc -aux-info`

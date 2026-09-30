@@ -2404,6 +2404,14 @@ printer spells every NaN `NAN` or `-NAN`, which compile back to the canonical
 quiet NaN, so a NaN with any other payload, a signalling NaN included, refuses,
 which is what keeps a literal-pool `vldr s0` of 0x7fc00123 its bits.
 
+The function returns one type in the register, so the candidate for one
+RETURN's value answers for every value a live RETURN hands back in that slot
+(`kuna_floatreg.rs (returned_beside)`): each is checked as above, and a constant
+returned as it is must spell exactly. `if (k) return packed.f; return 0.0f;`
+compiles to a `ret` on each path; the constant alone voted a float, and the
+global on the other path became one with it (crazyflie's packed-field getters,
+`ldr.w r3, [r3, #7]; vmov s0, r3`).
+
 An import stub's jump through its slot (`jmp *nanf@GOT`, recovered as a
 `CALLIND` whose result the stub returns) is typed the stub's own return when that
 is a float (`kuna_floatreg.rs (jump_result_type)`, the call's output local type):

@@ -3978,6 +3978,22 @@ decompiled once more without the float-register vote on its return
 return, so it declares what it did before this redo and the float vote (an
 integer, or `void`), and its readers are decompiled again against that.
 
+A function that hands on a callee's float return keeps returning a float once
+withdrawn: gcc -O1's `double wrapd(p, i) { return getd(p, i); }` returns the
+`double` `getd`'s own vote gave it, and the reader's `dat_40a0 = wrapd(..)`,
+which copies the eight bytes into a `uint64_t`, converted 2.25 to 2. So `record`
+files, for every function returning a float, the callees last recovered
+returning one whose result reaches a live RETURN through copies, casts, pieces
+and phi-nodes (`kuna_voidret.rs (float_sources)`), and `withdrawals` withdraws
+those with the function, and theirs in turn, down the chain of wrappers. The
+chain is redone in plan order, callee first, so each wrapper is decompiled
+against the integer its callee now returns; a reader of the chain that used the
+getter's result as a float directly goes back to what it printed before the
+float vote. A callee whose float return is declared (a libc row) or computed by
+its own float arithmetic is not withdrawn: its float is the type the machine
+computes, and a reader holding it as an integer prints what it did without the
+vote.
+
 A forced function whose final decompile still returns, on some path, a register
 a call only clobbers -- an INDIRECT creation the call's output never replaced --
 is withdrawn the same way (`kuna_voidret.rs (returns_a_call_clobber)`, filed by
