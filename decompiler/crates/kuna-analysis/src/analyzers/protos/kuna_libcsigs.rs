@@ -641,6 +641,11 @@ pub(super) const LIBC_EXT: &[(&str, Sig)] = &[
     ("pow", Sig { ret: Ty::Double, params: &[Ty::Double, Ty::Double], vararg: -1 }),
     ("sqrt", Sig { ret: Ty::Double, params: &[Ty::Double], vararg: -1 }),
     ("strtod", Sig { ret: Ty::Double, params: &[Ty::CharPtr, Ty::CharPtrPtr], vararg: -1 }),
+    // `locale_t` is glibc's `struct __locale_struct *`, a typedef the reduction
+    // does not see through. Without the row gnulib's `c_strtod` (a tail call to
+    // `strtod_l`) returns an integer beside `xstrtod`'s `double`, which then
+    // converts `c_strtod`'s result by value.
+    ("strtod_l", Sig { ret: Ty::Double, params: &[Ty::CharPtr, Ty::CharPtrPtr, Ty::VoidPtr], vararg: -1 }),
     ("strtof", Sig { ret: Ty::Float, params: &[Ty::CharPtr, Ty::CharPtrPtr], vararg: -1 }),
 ];
 
@@ -765,6 +770,8 @@ mod tests {
         assert!(matches!(get("strtod").ret, Ty::Double), "double strtod(const char *, char **)");
         assert!(matches!(get("strtof").ret, Ty::Float), "float strtof(const char *, char **)");
         assert!(matches!(get("strtod").params[1], Ty::CharPtrPtr));
+        assert!(matches!(get("strtod_l").ret, Ty::Double), "double strtod_l(const char *, char **, locale_t)");
+        assert!(matches!(get("strtod_l").params[..], [Ty::CharPtr, Ty::CharPtrPtr, Ty::VoidPtr]));
         assert!(matches!(get("pow").params[..], [Ty::Double, Ty::Double]));
         for name in ["strtold", "nanf", "fabsf", "sqrtf"] {
             assert!(

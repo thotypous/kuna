@@ -24,7 +24,9 @@
 //! whose return none does -- `f2u(a0)` beside `unsigned int f2u(unsigned int)`
 //! converts. And it is refused for a NaN constant `NAN` does not spell exactly,
 //! and for one half of an ARM register pair the function uses whole (a `double`
-//! in `d0`).
+//! in `d0`). The function returns one type in the register, so a refusal for
+//! any value a RETURN hands back there refuses them all: `if (k) return g.f;
+//! return 0.0f;`, with a `ret` on each path, reads a global on one of them.
 
 use std::rc::Rc;
 
@@ -57,16 +59,48 @@ fn vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>, jump: Option<crate::c
         return None;
     }
     let float = data.get_arch().types()?.get_base(size, type_metatype::TYPE_FLOAT).ok()?;
-    let family = crate::kuna_protoorder::value_family(data, vn);
-    if family.iter().any(|&v| data.vbank().get(v).is_some_and(|n| n.is_input()))
-        || crate::kuna_protoorder::input_refuses(data, vn, &float)
-        || family.iter().any(|&v| crosses_a_call_as_other_than_a_float(data, v, jump))
-        || family.iter().any(|&v| loaded_beside_integers(data, v))
-        || !spells_exactly(data, vn)
-    {
+    if returned_beside(data, vn).into_iter().any(|r| refuses(data, r, &float, jump)) {
         return None;
     }
     Some(float)
+}
+
+/// Does anything about the value `vn`, returned in a float register, refuse
+/// the float `float` for it?
+fn refuses(data: &Funcdata, vn: VarnodeId, float: &Rc<Datatype>, jump: Option<crate::context::OpId>) -> bool {
+    if data.vbank().get(vn).is_some_and(|n| n.is_constant()) {
+        return !spells(data, vn);
+    }
+    let family = crate::kuna_protoorder::value_family(data, vn);
+    family.iter().any(|&v| data.vbank().get(v).is_some_and(|n| n.is_input()))
+        || crate::kuna_protoorder::input_refuses(data, vn, float)
+        || family.iter().any(|&v| crosses_a_call_as_other_than_a_float(data, v, jump))
+        || family.iter().any(|&v| loaded_beside_integers(data, v))
+        || !spells_exactly(data, vn)
+}
+
+/// `vn` and every other value a live RETURN hands back in a slot `vn` is
+/// returned in: the function returns one type there, so a float is refused for
+/// all of them when it is refused for one. `if (ready) return packed.f; return
+/// 0.0f;` returns a global on one path and a constant on the other, and the
+/// constant alone would make the global a float.
+fn returned_beside(data: &Funcdata, vn: VarnodeId) -> Vec<VarnodeId> {
+    let Some(node) = data.vbank().get(vn) else { return vec![vn] };
+    let slots: Vec<int4> = node
+        .descend_iter()
+        .filter_map(|r| data.obank().get(r).filter(|o| o.code() == OpCode::CPUI_RETURN))
+        .flat_map(|o| (1..o.num_input()).filter(|&s| o.get_in(s) == Some(vn)).collect::<Vec<_>>())
+        .collect();
+    let mut out = vec![vn];
+    for r in data.obank().iter_code(OpCode::CPUI_RETURN) {
+        let Some(o) = data.obank().get(r).filter(|o| !o.is_dead()) else { continue };
+        for &s in &slots {
+            if let Some(v) = o.get_in(s).filter(|v| !out.contains(v)) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
 /// Does the value `v` cross a call as something no declaration or recovery
@@ -260,14 +294,18 @@ fn spells_exactly(data: &Funcdata, vn: VarnodeId) -> bool {
             OpCode::CPUI_MULTIEQUAL => def.num_input(),
             _ => 0,
         };
-        (0..inputs).filter_map(|k| def.get_in(k)).all(|c| {
-            let Some(node) = data.vbank().get(c).filter(|n| n.is_constant()) else { return true };
-            let Some(format) = data.get_arch().get_float_format(node.get_size()) else { return false };
-            let bits = node.get_offset() as u64;
-            if format.get_host_float(bits).1 != kuna_num::float::floatclass::nan {
-                return true;
-            }
-            node.get_size() <= 8 && (bits == format.get_encoding(f64::NAN) || bits == format.get_encoding(-f64::NAN))
-        })
+        (0..inputs).filter_map(|k| def.get_in(k)).all(|c| spells(data, c))
     })
+}
+
+/// Does `c`, when it is a constant, print as a float literal that compiles back
+/// to the same bits?
+fn spells(data: &Funcdata, c: VarnodeId) -> bool {
+    let Some(node) = data.vbank().get(c).filter(|n| n.is_constant()) else { return true };
+    let Some(format) = data.get_arch().get_float_format(node.get_size()) else { return false };
+    let bits = node.get_offset() as u64;
+    if format.get_host_float(bits).1 != kuna_num::float::floatclass::nan {
+        return true;
+    }
+    node.get_size() <= 8 && (bits == format.get_encoding(f64::NAN) || bits == format.get_encoding(-f64::NAN))
 }

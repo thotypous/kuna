@@ -2952,6 +2952,24 @@ fn a_float_handed_on_through_wrappers_to_an_integer_round_trips() {
     assert!(!printed.contains("float"), "a function of the chain returns a float:\n{printed}");
 }
 
+/// `floatret_beside_gcc_O2` (gcc -O2, stripped): `getf` returns a packed
+/// global's float on one path and `0.0f` on the other, each with its own `ret`.
+/// A value read from a global refuses the float-register vote, but the constant
+/// on the other path was voted alone, and the function returned `float` with
+/// the global in it. Every value the function returns in the register now
+/// answers for the vote.
+#[test]
+fn a_float_return_beside_a_global_read_stays_an_integer() {
+    let bin = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/floatret_beside_gcc_O2").to_str().unwrap().to_string();
+    let sp = specs();
+    let (stdout, stderr, ok) = run_kuna(&["decompile-all", &bin, "--sleighpath", &sp]);
+    assert!(ok, "kuna decompile-all failed: {stderr}");
+    let printed = printed_functions(&stdout, &["sub_1180 "]);
+    for want in ["unsigned int sub_1180(int a0)", "return 0;", "return dat_4017;"] {
+        assert!(printed.contains(want), "missing `{want}`:\n{printed}");
+    }
+}
+
 /// `dsum`, `norm` and `use` read their argument as `double *`, `struct P *` and
 /// `struct M *`, and each caller writes that memory with integer bits first. A
 /// pointer vote from the callee printed those stores as value conversions
