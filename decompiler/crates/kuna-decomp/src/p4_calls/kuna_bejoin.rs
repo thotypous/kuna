@@ -22,25 +22,26 @@
 //! So a pair is joined in the ABI's order only when its low word is returned on
 //! purpose, and first register low otherwise, exactly as before. The second
 //! register is judged at every live RETURN by walking back through moves to
-//! where its value was made:
+//! where its value was made ([`classify`]):
 //!
-//! * the two halves of one wide value (an 8-byte load, a call's two output
-//!   registers): the function hands back a wide value, joined in the ABI's
-//!   order whatever else it does -- the order a call's own pair is built in;
+//! * the two halves of one wider value (an 8-byte load, a product split by
+//!   `mflo`/`mfhi`): a wide value, whatever else the function does with it;
 //! * the register's own entry value, reached without an instruction that moves
-//!   it (untouched, or carried by a register window): a leftover, and the whole
-//!   function keeps the old join;
-//! * a value that is also used for anything but the returned pair (a store, a
-//!   call, a branch, an address, the first register's value other than through
-//!   its sign or a carry), or the first register's own value: scratch, and the
-//!   whole function keeps the old join;
+//!   it (untouched, or carried by a register window): a leftover;
+//! * a value also used for anything but the pair's RETURN slots (a store, a
+//!   call, a branch, an address, the first register other than through its
+//!   sign or a carry), or the first register's own value: scratch;
 //! * a literal zero: `-O0` leaves one behind, so it proves nothing either way;
+//! * a callee's clobber or a location never written: nothing;
 //! * anything else -- a value or a nonzero literal nothing but the RETURNs read
 //!   -- is returned on purpose.
 //!
-//! The pair is joined in the ABI's order when some RETURN returns its low word
-//! on purpose and none has a leftover or scratch there. The rule is a prior, not
-//! a proof: `(u64)x << 32` leaves the same zero in the second register as a
+//! The pair joins in the ABI's order when some RETURN holds a wide value, or
+//! when some RETURN returns its low word on purpose and none holds a leftover
+//! or scratch there. A function whose pair keeps the old join joins its calls'
+//! output pairs the old way too ([`joins_first_low`]), so a pair a call hands
+//! back and the function returns stays one value. The rule is a prior, not a
+//! proof: `(u64)x << 32` leaves the same zero in the second register as a
 //! function returning `int`, and a `long long` whose low word also feeds a call
 //! looks like scratch; both keep the old join, which is what they printed
 //! before.
@@ -156,7 +157,7 @@ fn classify(data: &Funcdata, retop: OpId, pair: &Pair) -> LowWord {
     if ends.overflow {
         return LowWord::Scratch;
     }
-    if ends.values.iter().any(|&v| !only_returned(data, v, pair)) {
+    if ends.values.iter().any(|&(v, _)| !only_returned(data, v, pair)) {
         return LowWord::Scratch;
     }
     if ends.entry {
@@ -165,14 +166,18 @@ fn classify(data: &Funcdata, retop: OpId, pair: &Pair) -> LowWord {
     if ends.values.is_empty() {
         return LowWord::Nothing;
     }
-    if ends.values.iter().all(|&v| literal_value(data, v, LITERAL_DEPTH) == Some(0)) {
+    let word = |(v, off): (VarnodeId, int4)| {
+        literal_value(data, v, LITERAL_DEPTH).map(|k| k.checked_shr(8 * off as u32).unwrap_or(0) & ones(pair.lo_size))
+    };
+    if ends.values.iter().all(|&e| word(e) == Some(0)) {
         return LowWord::Zero;
     }
     LowWord::Returned
 }
 
 /// Are `low` and `high`, through copies, the halves of one value at least two
-/// registers wide: `SUBPIECE(w, 0)` and `SUBPIECE(w, lo_size)`?
+/// registers wide: `SUBPIECE(w, 0)` and `SUBPIECE(w, lo_size)`, the second
+/// possibly spelled `SUBPIECE(w >> 8 * lo_size, 0)` (MIPS `mfhi`)?
 fn halves_of_one_value(data: &Funcdata, low: VarnodeId, high: VarnodeId, lo_size: int4) -> bool {
     let piece_of = |vn: VarnodeId| -> Option<(VarnodeId, u64)> {
         let mut cur = vn;
@@ -183,7 +188,21 @@ fn halves_of_one_value(data: &Funcdata, low: VarnodeId, high: VarnodeId, lo_size
                 OpCode::CPUI_INDIRECT if !op.is_indirect_creation() => cur = op.get_in(0)?,
                 OpCode::CPUI_SUBPIECE => {
                     let at = data.vbank().get(op.get_in(1)?)?;
-                    return at.is_constant().then(|| (op.get_in(0), at.get_offset())).and_then(|(w, k)| Some((w?, k)));
+                    if !at.is_constant() {
+                        return None;
+                    }
+                    let whole = op.get_in(0)?;
+                    let shifted = data.vbank().get(whole)?.get_def().and_then(|d| data.obank().get(d)).and_then(|sh| {
+                        let by = data.vbank().get(sh.get_in(1)?)?;
+                        (matches!(sh.code(), OpCode::CPUI_INT_RIGHT | OpCode::CPUI_INT_SRIGHT)
+                            && by.is_constant()
+                            && by.get_offset() % 8 == 0)
+                            .then(|| (sh.get_in(0), by.get_offset() / 8))
+                    });
+                    return match shifted {
+                        Some((Some(w), bytes)) => Some((w, at.get_offset() + bytes)),
+                        _ => Some((whole, at.get_offset())),
+                    };
                 }
                 _ => return None,
             }
@@ -199,26 +218,29 @@ fn halves_of_one_value(data: &Funcdata, low: VarnodeId, high: VarnodeId, lo_size
 /// Where a returned value was made ([`ends_of`]).
 #[derive(Default)]
 struct Ends {
-    /// Values and literals the walk stopped at.
-    values: Vec<VarnodeId>,
+    /// Values and literals the walk stopped at, each with the byte offset of
+    /// the low word inside it.
+    values: Vec<(VarnodeId, int4)>,
     /// The register's own entry value, reached with no instruction moving it.
     entry: bool,
     /// The walk ran out of budget.
     overflow: bool,
 }
 
-/// Walk back from `low` through moves -- copies, phis, indirects, a register
-/// heritage split into pieces -- to where its value was made. A copy that a
-/// register window makes ([`moves_register_window`]) does not count as the
-/// function moving the value; any other does, so the entry value of `own`
-/// reached through one is a value the function put back on purpose (ARM's
-/// `mov r4,r1; bl ext; mov r1,r4`).
-fn ends_of(data: &Funcdata, low: VarnodeId, own: &Address, own_size: int4) -> Ends {
+/// Walk back from `low` through moves -- copies, phis, indirects, and the
+/// pieces of a wider register heritage splits and joins (SPARC's `ldd` writes
+/// `%i0:%i1` as one) -- to where its `lo_size` bytes were made, following the
+/// byte offset of those bytes inside each wider value. A copy that a register
+/// window makes ([`moves_register_window`]) does not count as the function
+/// moving the value; any other does, so the entry value of `own` reached
+/// through one is a value the function put back on purpose (ARM's `mov r4,r1;
+/// bl ext; mov r1,r4`).
+fn ends_of(data: &Funcdata, low: VarnodeId, own: &Address, lo_size: int4) -> Ends {
     let mut ends = Ends::default();
-    let mut seen: BTreeSet<(VarnodeId, bool)> = BTreeSet::new();
-    let mut work = vec![(low, false)];
-    while let Some((cur, moved)) = work.pop() {
-        if !seen.insert((cur, moved)) {
+    let mut seen: BTreeSet<(VarnodeId, int4, bool)> = BTreeSet::new();
+    let mut work = vec![(low, 0, false)];
+    while let Some((cur, off, moved)) = work.pop() {
+        if !seen.insert((cur, off, moved)) {
             continue;
         }
         if seen.len() > MAX_NODES {
@@ -227,61 +249,66 @@ fn ends_of(data: &Funcdata, low: VarnodeId, own: &Address, own_size: int4) -> En
         }
         let Some(v) = data.vbank().get(cur) else { continue };
         if v.is_constant() {
-            ends.values.push(cur);
+            ends.values.push((cur, off));
             continue;
         }
         let Some(def) = v.get_def() else {
             if !v.is_input() {
                 continue;
             }
-            if !moved && inside(v.get_addr(), v.get_size(), own, own_size) {
+            if !moved && slice_address(v.get_addr(), v.get_size(), off, lo_size).as_ref() == Some(own) {
                 ends.entry = true;
             } else {
-                ends.values.push(cur);
+                ends.values.push((cur, off));
             }
             continue;
         };
         let Some(op) = data.obank().get(def) else { continue };
+        let input = |i: int4| op.get_in(i).and_then(|x| data.vbank().get(x).map(|v| (x, v)));
         match op.code() {
-            OpCode::CPUI_COPY if !op.get_in(0).and_then(|x| data.vbank().get(x)).is_some_and(|x| x.is_constant()) => {
-                work.extend(op.get_in(0).map(|x| (x, moved || !moves_register_window(data, def))));
+            OpCode::CPUI_COPY if !input(0).is_some_and(|(_, x)| x.is_constant()) => {
+                work.extend(op.get_in(0).map(|x| (x, off, moved || !moves_register_window(data, def))));
             }
             OpCode::CPUI_INDIRECT if op.is_indirect_creation() => {}
-            OpCode::CPUI_INDIRECT => work.extend(op.get_in(0).map(|x| (x, moved))),
-            OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_PIECE => {
-                work.extend((0..op.num_input()).filter_map(|i| op.get_in(i)).map(|x| (x, moved)));
+            OpCode::CPUI_INDIRECT => work.extend(op.get_in(0).map(|x| (x, off, moved))),
+            OpCode::CPUI_MULTIEQUAL => {
+                work.extend((0..op.num_input()).filter_map(|i| op.get_in(i)).map(|x| (x, off, moved)));
             }
-            OpCode::CPUI_SUBPIECE
-                if op.get_in(0).and_then(|x| data.vbank().get(x)).is_some_and(|x| x.get_def().is_none()) =>
-            {
-                work.extend(op.get_in(0).map(|x| (x, moved)));
-            }
-            _ => ends.values.push(cur),
+            OpCode::CPUI_PIECE => match (input(0), input(1)) {
+                (Some((hi, _)), Some((_, lo))) if off >= lo.get_size() => work.push((hi, off - lo.get_size(), moved)),
+                (Some(_), Some((lo_id, lo))) if off + lo_size <= lo.get_size() => work.push((lo_id, off, moved)),
+                _ => ends.values.push((cur, off)),
+            },
+            OpCode::CPUI_SUBPIECE => match (input(0), input(1)) {
+                (Some((whole, _)), Some((_, k))) if k.is_constant() => work.push((whole, off + k.get_offset() as int4, moved)),
+                _ => ends.values.push((cur, off)),
+            },
+            _ => ends.values.push((cur, off)),
         }
     }
     ends
 }
 
-/// Does `[addr, addr + size)` lie inside the `own_size`-byte register at `own`?
-fn inside(addr: &Address, size: int4, own: &Address, own_size: int4) -> bool {
-    match (addr.get_space(), own.get_space()) {
-        (Some(a), Some(b)) if Rc::ptr_eq(a, b) => {
-            addr.get_offset() >= own.get_offset()
-                && addr.get_offset() + size as u64 <= own.get_offset() + own_size as u64
-        }
-        _ => false,
-    }
+/// Where the `size` bytes `off` bytes above the least significant byte of the
+/// `whole`-byte value at `addr` are stored.
+fn slice_address(addr: &Address, whole: int4, off: int4, size: int4) -> Option<Address> {
+    let space = addr.get_space()?;
+    let rel = if space.is_big_endian() { whole - off - size } else { off };
+    (rel >= 0).then(|| Address::new(Rc::clone(space), space.wrap_offset(addr.get_offset().wrapping_add(rel as u64))))
 }
 
 /// Is every use of `value` -- and of everything computed from it -- one of the
 /// pair's RETURN slots: the low word itself, or the first register through the
-/// value's sign (`sra 31`, an extension), a carry or borrow out of it, or the
-/// other half of a wider value? Reaching the first register any other way, or
-/// unchanged, makes it scratch; so does a call, a store, a branch or an address.
+/// value's sign (`sra 31`, the high half of its extension), a comparison (a
+/// carry or borrow out of it), or the other half of a wider value? Reaching the
+/// first register any other way, or unchanged, makes it scratch -- a literal
+/// SPARC multiplies by is extended into the product, not returned -- and so
+/// does a call, a store, a branch or an address.
 fn only_returned(data: &Funcdata, value: VarnodeId, pair: &Pair) -> bool {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum Via {
         Same,
+        Extended,
         Changed,
         Excused,
     }
@@ -336,10 +363,13 @@ fn only_returned(data: &Funcdata, value: VarnodeId, pair: &Pair) -> bool {
                     }
                     via
                 }
-                OpCode::CPUI_SUBPIECE if v.get_size() > pair.lo_size => Via::Excused,
-                OpCode::CPUI_INT_SEXT
-                | OpCode::CPUI_INT_ZEXT
-                | OpCode::CPUI_INT_EQUAL
+                OpCode::CPUI_SUBPIECE
+                    if via == Via::Extended || (via == Via::Same && v.get_size() > pair.lo_size) =>
+                {
+                    Via::Excused
+                }
+                OpCode::CPUI_INT_SEXT | OpCode::CPUI_INT_ZEXT if via != Via::Excused => Via::Extended,
+                OpCode::CPUI_INT_EQUAL
                 | OpCode::CPUI_INT_NOTEQUAL
                 | OpCode::CPUI_INT_LESS
                 | OpCode::CPUI_INT_LESSEQUAL
@@ -348,6 +378,17 @@ fn only_returned(data: &Funcdata, value: VarnodeId, pair: &Pair) -> bool {
                 | OpCode::CPUI_INT_CARRY
                 | OpCode::CPUI_INT_SCARRY
                 | OpCode::CPUI_INT_SBORROW => Via::Excused,
+                OpCode::CPUI_INT_RIGHT | OpCode::CPUI_INT_SRIGHT
+                    if via == Via::Same
+                        && v.get_size() > pair.lo_size
+                        && op.get_in(0) == Some(cur)
+                        && op
+                            .get_in(1)
+                            .and_then(|k| data.vbank().get(k))
+                            .is_some_and(|k| k.is_constant() && k.get_offset() >= 8 * pair.lo_size as u64) =>
+                {
+                    Via::Excused
+                }
                 OpCode::CPUI_INT_SRIGHT
                     if op.get_in(0) == Some(cur)
                         && op
@@ -372,6 +413,15 @@ fn only_returned(data: &Funcdata, value: VarnodeId, pair: &Pair) -> bool {
 /// own input passing through such a call is not yet an argument of it.
 fn undecided_input(data: &Funcdata, call: OpId) -> bool {
     data.get_call_specs_index(call).is_some_and(|i| data.get_call_specs(i).is_input_active())
+}
+
+/// Every bit of a `size`-byte value set.
+fn ones(size: int4) -> u64 {
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * size)) - 1
+    }
 }
 
 /// The value of `vn` when it is a constant or integer arithmetic and logic on
