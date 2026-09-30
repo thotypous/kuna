@@ -9,13 +9,16 @@
     two in-tree fixtures (sources beside them).
 
     floatret_cm4.o is a Cortex-M4F object: qnanf_ loads the quiet NaN
-    0x7fc00000 into s0 and returns it, and logish returns -INFINITY in s0 on
-    one path and tail-calls qnanf_ on another. Nothing computes with either
-    value as a float, so the fold typed them as integers: qnanf_ returned
-    0x7fc00000 as an unsigned int, logish returned 0xff800000, and a caller
-    that used the result as a float converted the bits as a number (the NaN
-    became 2143289344.0). s0 is a float register, so both are float4 and the
-    constants print as NAN and -INFINITY.
+    0x7fc00000 into s0 and returns it. Nothing computes with the value as a
+    float, so the fold typed it an integer: qnanf_ returned 0x7fc00000 as an
+    unsigned int, and a caller that used the result as a float converted the
+    bits as a number (the NaN became 2143289344.0). s0 is a float register, so
+    it is float4 and the constant prints as NAN. logish returns -INFINITY in
+    s0 on one path and the results of core and qnanf_ on the others; decompiled
+    alone it knows neither callee's return, a float would convert both by
+    value, so the function returns the same register as the bits it is
+    (0xff800000). decompile-all, which knows both callees return floats, types
+    it float (decompile_all_cli.rs a_nan_returned_in_s0_round_trips).
 
     floatret_x86_64 is a stripped clang -O0 PIE: sub_11c0 and sub_11d0 return
     a global float and double in xmm0 and stay integers: one declaration of a
@@ -85,9 +88,9 @@ c3
 </script>
 <stringmatch name="FLOATRET #1: a NaN returned in s0 is a float" min="1" max="1">float4 qnanf_\(void\)</stringmatch>
 <stringmatch name="FLOATRET #2: and prints as NAN, not its bits" min="1" max="1">return NAN;</stringmatch>
-<stringmatch name="FLOATRET #3: a function returning -INFINITY in s0 returns a float" min="1" max="1">float4 logish\(float4 a0\)</stringmatch>
-<stringmatch name="FLOATRET #4: and prints it as -INFINITY" min="1" max="1">return -INFINITY;</stringmatch>
-<stringmatch name="FLOATRET #5: no bit pattern is returned as an integer" min="0" max="0">0x7fc00000|0xff800000</stringmatch>
+<stringmatch name="FLOATRET #3: a function also returning calls it cannot see the type of is not a float" min="1" max="1">unsigned int logish\(float4 a0\)</stringmatch>
+<stringmatch name="FLOATRET #4: and returns -INFINITY as its bits" min="1" max="1">return 0xff800000;</stringmatch>
+<stringmatch name="FLOATRET #5: the quiet NaN is not returned as an integer" min="0" max="0">0x7fc00000</stringmatch>
 <stringmatch name="FLOATRET #6: a global returned in xmm0 is not typed a float" min="0" max="0">float[48] sub_11[cd]0\(void\)</stringmatch>
 <stringmatch name="FLOATRET #7: NaNs NAN cannot spell keep their bits" min="3" max="3">return (0x7fc00123|0x7fa00000|0xffc00005);</stringmatch>
 <stringmatch name="FLOATRET #8: a parameter handed back untouched is its callers' to type" min="1" max="1">unsigned int sub_11f0\(unsigned int a0\)</stringmatch>
