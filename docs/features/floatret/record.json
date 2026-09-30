@@ -1,0 +1,291 @@
+{
+ "opportunity": "A value a function returns in a float register printed as an integer or not at all, and a function that returns its callee's result (`call g; ret`) printed void while its callers read the result. clang -O0 `float qnan(void){return nanf(\"\");}` printed `void sub_1150(void) { nanf((char *)0x2016); }` beside `v1 = (float)sub_1150();`, which no compiler accepts; a Cortex-M4F `nanf` printed `unsigned int sub_80049bc(void) { return 0x7fc00000; }` and its caller `(float)sub_80049bc()`, which evaluates to 2143289344.0 where the machine returns NaN. Over the 45 cast-corpus binaries main printed 2,123 uses of a void function's result.",
+ "analysis": {
+  "type": "p5_types/kuna_floatreg.rs votes a float of the register's width for a value a RETURN reads from a float-class output entry. It never votes a parameter: a function's callers decide what it receives, and a float parameter handed on or back printed a conversion by value in any caller or callee that holds the bits as an integer (x86-64 signbit_ handing its xmm0 float to f2u(unsigned int); Cortex-M4F/AArch64 putf2 moving s0 into r0 for put3(u32); a struct{float,float} caller; crazyflie O2-noinline sub_8028ae8 -> sub_8028914). The return vote is refused where the value's family holds an input, crosses a call (argument or result) that no declaration, protoorder statement or recorded recovery makes a float, is loaded through a pointer the function also moves integers through at that width, or where protoorder refuses a callee's float vote (integer computation, a store, a piece, a global); a NaN NAN cannot spell and one half of an ARM d register used whole also refuse. voidret (p4_calls/kuna_voidret.rs + decompile_all/callee_first.rs) redoes a function recovered void whose result a caller reads; a redo that leaves it returning a register a call only clobbers (an INDIRECT creation the call's output never replaced: gcc -O0 call_f2u, whose joined argument PIECE sits between the creation and the call) is withdrawn, and a float return any reader converts (held as an integer, passed to an integer parameter by position, stored through an integer pointer, returned as an integer) is withdrawn and its readers redone.",
+  "void": "`call g; ret` is both `void f(){g();}` and `T f(){return g();}`; upstream's ancestorOpUse refuses a call's result outright and heritage registers no return trial for a register no op names. p4_calls/kuna_voidret.rs files, in decompile-all's callee-first run, every function recovered void and every call output a caller reads; the driver redoes such a function as soon as its first reader is decompiled, with the storage the callers read seeded, and accepts it only where it is the return value at every live RETURN (ancestorOpUse with a call's result counting), no wider than every path sets (set_tz returns eax, not a half-set rax). A later wider reader widens it; readers of different registers withdraw it.",
+  "readers": "Every reader decompiled before a redo changed its callee's return is decompiled again (small readers always, readers over AUDIT_MAX_OPS only for a wrong value: an in-place offset from a now-scaled pointer, a float held as another type). A caller that refused or withdrew a callrettype statement of the other class converts explicitly ((long)sub_eecc(..)); a float statement is the token of a result held as raw bytes (a store through an untyped pointer stores the float).",
+  "libc": "float/double added to the protos Ty vocabulary; the libcwiden corpus rule then admits ceil log2 modf pow sqrt strtod strtof; strtold (long double) and strtod_l (locale_t) stay rejected.",
+  "rejected_designs": "Accepting the forced return wherever AncestorRealistic holds merged scratch-register values into the return variable (fmt get_space, sort xstrxfrm). Redoing every stale reader after the whole first pass cost bash -O2 +45% and sort -O2 +59% (their main functions redone, 10 s each); settling after each function redoes a wrapper at its first reader instead. Filtering stale readers by held class kept 112 conversions of stale results. An ARM pair rule that refused s0 whenever s1 was touched (every call's parameter trials touch it) left clampf an unsigned int returning fminf's float, a value conversion."
+ },
+ "plan": "Strict correctness fix, no option (a float register is the float declaration; a void function whose result a caller reads, and a caller whose text disagrees with its callee's declaration, are wrong output). Round trips compiled with gcc and clang that fail on main; stage test; corpus footprint classified with wrong-output counters; castbench, typesweep with arity counters, speed, all gates.",
+ "test_name": "kuna-cli/tests/decompile_all_cli.rs a_float_register_return_and_a_read_void_result_round_trip, a_nan_returned_in_s0_round_trips, a_wrapper_returns_its_callees_result_round_trip, a_reader_of_a_redone_wrapper_round_trips (each fails on main); a_float_crossing_an_integer_call_round_trips (signbit_, fetch, use/mk/first_of at clang -O0; gcc -O0 call_f2u never returns an unassigned local) and a_float_handed_on_to_an_integer_parameter_round_trips (Cortex-M4F and AArch64 putf2) pass on main and fail on the reviewed revision 0aec6b59f (0 40000000 0 for 1 3fc00001 3fc00000; cm4 stores 1 2 7); a_float_pair_held_as_an_integer_round_trips (gcc -O2 struct { float, float }, the first two floats of three, float _Complex, each copied into a uint64_t global) passes on main and fails on the reviewed revision 82746c20f (2 0 1 2 0 2 0 for 400000003f800000 40000000 1 400000003f800000 40000000 400000003f800000 40000000, gcc and clang). tests/stages/kuna-floatret.xml (10 assertions: #8 idf stays unsigned int, #10 putf2 keeps unsigned int parameters) and tests/cli/float-register-return-is-a-float.json; kuna-cli/tests/arm_wrapper_returns.rs (#752): its indirect-call and argument-write wrappers and its passthrough-off wrappers return their callee's result, because the fixture's consumer reads r0 after the call (main printed v1 = wrapper() of a void wrapper)",
+ "binary": "decompiler/crates/kuna-analysis/tests/fixtures/floatret_x86_64 (clang -O0), floatret_cm4.o (Cortex-M4F, clang -O2), floatret_wrap_{gcc_O0,clang_O0,gcc_O2}, floatret_stale_gcc_O0, floatret_calls_{clang,gcc}_O0, floatret_put_{cm4,a64}.o, floatret_pair_gcc_O2 (gcc -O2, stripped)",
+ "option": null,
+ "change_kind": "strict correctness fix (no option)",
+ "default_on": true,
+ "parity": {
+  "datatests": "675/675 PARITY OK",
+  "stages": "1578/1578 PARITY OK (main 490dd3855 1568 + 10 FLOATRET)"
+ },
+ "castbench": {
+  "base": "main aaf21509b (fresh arm .scratch/cb-mainAAF, 32,075 casts); main 815bd4cca (#760, #753, #751, #752) prints byte-identical output on all 45 binaries (.scratch/cb-main815), and so does the branch rebased on it against 272cf1a67; the branch rebased on 490dd3855 (#754, #750 opt-in) prints the same again",
+  "shared_functions": 4815,
+  "casts": {
+   "main": 32075,
+   "fix": 31646,
+   "ida": 37821,
+   "ratio_main": 0.848,
+   "ratio_fix": 0.837
+  },
+  "per_100_stmts": {
+   "main": 27.0,
+   "fix": 26.6,
+   "ida": 27.0
+  },
+  "by_opt": {
+   "O0": [
+    9934,
+    9743
+   ],
+   "O2": [
+    12207,
+    12102
+   ],
+   "O2-noinline": [
+    9934,
+    9801
+   ]
+  },
+  "functions_fewer_casts": 258,
+  "casts_removed": 605,
+  "functions_more_casts": 133,
+  "casts_added": 176,
+  "shapes": "(char*)<call> -542 (callers read the wrapper's stated char *); (i64)<call> +156 (explicit conversions where a caller keeps a now-pointer result as an integer, required by C)",
+  "vs_reviewed_82746c20f": "31,795 -> 31,646: 643 functions change. Readers whose call result ActionSetCasts converted (the call writes a temporary) are now filed: 273 more wrappers return their callee's result (import stubs mmap/bsearch/context_str, getenv/setlocale/dcgettext/quotearg wrappers, obstack's call_chunkfun), their callers drop the (T) of a void call, and the rest is struct renumbering and renames; hand-checked cp sub_4bf0, wc sub_3bf0, tar sub_28ce0, ls sub_18845 (same computation)."
+ },
+ "corpus_footprint": {
+  "castbench_45": {
+   "functions": 20230,
+   "changed": 2091,
+   "void_to_returning": 1023,
+   "signature_other": 380,
+   "caller_of_retyped_callee": 363,
+   "body_only": 312,
+   "float_signature": 13,
+   "return_to_float": 13,
+   "param_lists_with_float_change": 4,
+   "void_result_uses": [
+    2123,
+    395
+   ],
+   "pointer_integer_assignments_without_conversion": [
+    275,
+    184
+   ],
+   "pointer_call_arithmetic": [
+    114,
+    111
+   ],
+   "explicit_int_to_pointer_casts_into_pointer_locals": [
+    191,
+    160
+   ],
+   "never_assigned_returns": [
+    268,
+    268
+   ],
+   "concat_of_killed_register": [
+    227,
+    227
+   ],
+   "float_value_conversion_of_int_call": [
+    24,
+    28,
+    "rose only in tail O2 main: the four (double)lseek(..) it printed of a void lseek are now of an unsigned long one"
+   ],
+   "void_result_uses_incl_casts": {
+    "instrument": ".scratch/r5/voiduse3.py (x = f(), x = (T)f(), return f(), g(f()), f() + n of a void f)",
+    "main": 5031,
+    "reviewed_82746c20f": 1697,
+    "fix": 1303,
+    "rose_functions": 0
+   }
+  },
+  "disjoint_40": {
+   "binaries": 40,
+   "functions": 41282,
+   "changed": 2430,
+   "return_to_float": 110,
+   "param_lists_with_float_change": 2,
+   "void_result_uses": [
+    5112,
+    1833
+   ],
+   "never_assigned_returns": [
+    173,
+    171
+   ],
+   "float_value_conversion_of_int_call": [
+    343,
+    290
+   ],
+   "concat_of_killed_register": [
+    580,
+    580
+   ],
+   "ptr_gets_intcast": [
+    85,
+    85
+   ],
+   "rises": 0,
+   "void_result_uses_incl_casts": {
+    "main": 8605,
+    "reviewed_82746c20f": 3486,
+    "fix": 3217,
+    "rose_functions": 0
+   }
+  },
+  "vs_reviewed_82746c20f": "castbench 45: 643 functions changed; disjoint 40: 453. never-assigned returns, CONCAT of a killed register, float conversions of an integer call, pointer locals assigned an integer cast and unset variables all flat (0 rises)",
+  "disjoint_40_vs_main815": {
+   "base": "main 815bd4cca (#752 passthrough returns ARM/MIPS wrapper results)",
+   "changed": 2390,
+   "never_assigned_returns": [
+    173,
+    171
+   ],
+   "float_value_conversion_of_int_call": [
+    343,
+    293
+   ],
+   "concat_of_killed_register": [
+    580,
+    580
+   ],
+   "ptr_gets_intcast": [
+    85,
+    85
+   ],
+   "unset_vars": [
+    14549,
+    14535
+   ],
+   "void_result_uses_incl_casts": [
+    8314,
+    3217
+   ],
+   "implicit_int_float_conversions": [
+    910,
+    910
+   ],
+   "rises": 0
+  }
+ },
+ "benchmark": {
+  "instrument": "444-slice typesweep, finalsweepopt, DECBENCH_PIN /home/mahaloz/kwt/_final-d/db625, base arm = main aaf21509b built fresh (.scratch/sweep-mainAAF)",
+  "n": 10748,
+  "perfect_main": 1674,
+  "perfect_fix": 1674,
+  "mean_main": 0.3753,
+  "mean_fix": 0.3753,
+  "improved": 4,
+  "worse": 2,
+  "per_project": {
+   "coreutils": {
+    "n": 6422,
+    "perfect": [
+     1019,
+     1020
+    ],
+    "improved": 4,
+    "worse": 0
+   },
+   "grep": {
+    "n": 247,
+    "perfect": [
+     55,
+     54
+    ],
+    "improved": 0,
+    "worse": 2
+   }
+  },
+  "arity": {
+   "functions": 11156,
+   "more_variables": 1,
+   "fewer_variables": 0,
+   "note": "find get_relative_timestamp gains its GT double sec_per_unit in xmm0 (unchanged from the reviewed revision)"
+  },
+  "worse_rows": "grep kwsinit at O0 (1.0 -> 0.667) and O2 (0.5 -> 0.25): kwsinit returns kwsalloc (trans), which the reviewed revision left void while its caller printed `v15 = (void *)sub_e5c0(0)` (not C). Returning it puts kwsalloc's result in the rax that xmalloc's result arrives in, and elemptr leaves a pointer vote alone in a register the function returns another value in (returns_another_value_in_place, the guard for tar's sub_135e3), so `trans` prints `long` with `*(char *)(v3 + v4) = ..` (the same address) where main printed `char *`. Kept: correctness over type_match; the perfect count equals main's",
+  "code": "272cf1a67 (.scratch/sweep-r5c vs .scratch/sweep-mainAAF)"
+ },
+ "speed": {
+  "method": "whole-binary decompile-all --json, interleaved min-of-15, main aaf21509b vs this branch (code 272cf1a67, the same as the rebased 5d0e6c84c), O2 stripped, contended box (load 16-25)",
+  "fmt": {
+   "main_min_ms": 4216.8,
+   "fix_min_ms": 4340.9,
+   "delta_min_pct": 2.94,
+   "delta_median_pct": 5.01
+  },
+  "ls": {
+   "main_min_ms": 14486.3,
+   "fix_min_ms": 15029.1,
+   "delta_min_pct": 3.75,
+   "delta_median_pct": -1.51
+  },
+  "sort": {
+   "main_min_ms": 15062.1,
+   "fix_min_ms": 15084.3,
+   "delta_min_pct": 0.15,
+   "delta_median_pct": 0.53
+  },
+  "bash": {
+   "main_min_ms": 87323.8,
+   "fix_min_ms": 91265.8,
+   "delta_min_pct": 4.51,
+   "delta_median_pct": 3.92
+  }
+ },
+ "gates": {
+  "make_test": "675/675 PARITY OK (d55b9ba09, rebased on 490dd3855)",
+  "make_test_stages": "1578/1578 PARITY OK (baseline re-recorded on 490dd3855: +10 FLOATRET keys, nothing else moved)",
+  "check_spec": "OK lenient + strict (d55b9ba09)",
+  "test_cli": "275/275 (d55b9ba09)",
+  "catalog_check": "OK",
+  "counters_check": "no drift",
+  "options_md": "fresh",
+  "rust_test": "7,539 passed / 0 failed / 38 ignored (447 test binaries), RUST_TEST_RC=0 on d55b9ba09 (rebased on 490dd3855)",
+  "lint": "make lint OK (272cf1a67, same code)"
+ },
+ "known_residue": [
+  "ARM hard-float and AArch64 doubles in d0/q0 are recovered at the wrong width (trial recovery never consults the join rule); the low half of a d0 is refused the float vote and stays the integer it was",
+  "x86-64 gcc code that writes all of xmm0 (movd/pxor/movq) before a call gets no output trial there (calloverlap off): gcc -O0 `pick` stays void",
+  "395 void-result reads on the cast corpus remain: values also tested/indexed before being returned (coreutils base_len), refused by upstream's sole-use rule",
+  "69 new pointer/integer assignments without a conversion on the cast corpus (25 functions): readers over AUDIT_MAX_OPS keep their stale text unless it computes a wrong value, and variables the merge left untyped print as unsigned long; each read a void result before",
+  "timeout O2 `(double)sub_70a0(..)`: an identity cast; sub_70a0 states nothing to callrettype because its strtod_l tail path returns an unset xmm0 (pre-existing, main printed `unsigned long ... return v1;`)",
+  "a float return withdrawn because one reader keeps it as an integer leaves the other readers' `(float)f()` value conversions as main printed them",
+  "No parameter is typed float from its register: a function that only hands a float parameter on or back (idf, pass) keeps the integer its body gives it, and callers that pass it a computed float print the conversion main printed (clang -O0 call_f2u: v1 = f2u(dat_2004 + a0) beside f2u(unsigned int)); the parameter vote converted in whichever caller or callee held the bits as an integer instead",
+  "gcc -O0 call_f2u stays void: the PIECE that builds f2u's joined argument sits between the call and its INDIRECT creations, so the call never gains an output (collect_output_trial_varnodes looks only at the INDIRECTs right before the call); the redo that returned the clobbered register is withdrawn",
+  "Code that falls into fldz padding (openssh mprintf O2, scp O0 wrappers) returns 0.0 in ST0 where main printed an integer 0: the same bits, from a flow artifact main also had",
+  "gcc -O1/-O2 code that reads xmm0 after a call to a function returning a struct of two floats (`memcpy(&u, &v, 8); return u ^ i;`) gets no call output there (the whole-xmm0 ContainedBy gap above) and prints `sub_11b0(); return v1 ^ a0;` of an unset v1, as main does",
+  "A struct { float, float } getter (`return *p;`, movq (%rdi),%xmm0) whose caller reads only the low float returns `double` from `double *`, and the caller converts `(float)sub_11a0(..)` by value; main printed `unsigned long` and the same conversion",
+  "A function returning a struct timespec in rax:rdx that a forced redo reaches (sleep/timeout dtotimespec) returns only rax as `unsigned long`; its callers still read 16 bytes (`char v2[16]; v2 = sub_6641();`). main printed `void`; neither compiles"
+ ],
+ "implicit_conversions": {
+  "instrument": ".scratch/r4/implconv.py: an argument whose class (int/float, inferred only from declared variables, derefs of declared pointers, printed calls, casts and literals) differs from the printed callee parameter; x = callee() of the other class; return e of the other class",
+  "castbench_45": {
+   "main": 15,
+   "reviewed_0aec6b59f": 503,
+   "fix": 18,
+   "rose_functions": 3,
+   "rose_note": "find O0 callers of get_relative_timestamp (sub_1916a): the callee now takes its real double sec_per_unit in xmm0 (modf's declaration shows the body multiply it) and the callers, which never set xmm0, pass one argument too few; the counter reads them positionally. A compile error, not a conversion.",
+   "reviewed_82746c20f": 18
+  },
+  "disjoint_40": {
+   "main": 910,
+   "reviewed_0aec6b59f": 4256,
+   "fix": 910,
+   "rose_functions": 0,
+   "reviewed_82746c20f": 910
+  },
+  "crazyflie_O2_noinline": {
+   "main": 262,
+   "reviewed_0aec6b59f": 298,
+   "fix": 262
+  },
+  "betaflight_O2_noinline": {
+   "main": 101,
+   "reviewed_0aec6b59f": 120,
+   "fix": 101
+  }
+ }
+}

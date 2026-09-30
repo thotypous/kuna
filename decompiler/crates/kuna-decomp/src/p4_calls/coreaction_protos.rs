@@ -1022,6 +1022,8 @@ impl Action for ActionFuncLink {
             ActionFuncLink::func_link_output(i, data);
         }
         crate::p4_calls::kuna_passthrough::claim_untouched_registers(data);
+        crate::p4_calls::kuna_voidret::plant(data);
+        crate::kuna_floatreg::note_float_pairs(data);
         0
     }
 }
@@ -1657,6 +1659,7 @@ impl Action for ActionReturnRecovery {
             }
         }
 
+        crate::p4_calls::kuna_voidret::score_forced(data, &mut active, &return_ops, maxancestor);
         crate::p4_calls::kuna_condexeret::end_pass(&mut active, cond_exe_ret, cond_failed);
         active.finish_pass();
         if active.get_num_passes() > active.get_max_pass() {
