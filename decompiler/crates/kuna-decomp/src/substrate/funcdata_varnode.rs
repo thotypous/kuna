@@ -909,12 +909,6 @@ impl Funcdata {
                 }
             }
             if self.vbank().get(vn).map(|v| v.is_free()).unwrap_or(false) {
-                if let Some(high) = self.vbank().get(vn).and_then(|v| v.get_high()) {
-                    self.high_remove_member(high, vn);
-                    if self.high_bank().is_unattached(high) {
-                        self.high_bank_mut().erase(high);
-                    }
-                }
                 self.vbank_mut().destroy(vn)?;
             }
         }
@@ -3317,19 +3311,6 @@ mod tests {
     }
 
     // --- deletion / teardown ---------------------------------------------
-
-    #[test]
-    fn a_cleared_dead_input_leaves_its_high_variable() {
-        let mut fd = build_fd();
-        let r = ram(&fd);
-        let vn = fd.new_varnode(4, &Address::new(r, 0x40), None);
-        let input = fd.set_input_varnode(vn).unwrap();
-        fd.set_high_level();
-        let high = fd.vbank().get(input).and_then(|v| v.get_high()).expect("the input has a high");
-        fd.clear_dead_varnodes().unwrap();
-        assert!(fd.vbank().get(input).is_none(), "an input nothing reads is cleared");
-        assert!(fd.high_bank().is_unattached(high), "and no HighVariable still lists it");
-    }
 
     #[test]
     fn delete_varnode_removes_free() {

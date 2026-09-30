@@ -545,7 +545,7 @@ pub fn build_output_from_trials(
         // halves become SUBPIECEs of it, instead of staying INDIRECT creations
         // that render as locals the function never assigns.
         let entry = fc.get_entry_address().clone();
-        let order = fc.get_active_output().join_pair_order();
+        let order = if data.kuna_pairs_first_low() { (0, 1) } else { fc.get_active_output().join_pair_order() };
         if crate::kuna_rustabi::build_call_output_pair(op, data, &finalvn, Some(&entry), order) {
             return;
         }

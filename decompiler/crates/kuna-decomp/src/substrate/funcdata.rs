@@ -407,10 +407,11 @@ pub struct Funcdata {
     /// block read the return register, which carries no argument, before it
     /// writes it (`test %al,%al` in a SysV register-save prologue)?
     kuna_passthrough_variadic: bool,
-    /// (kuna) Return recovery joined a register-window pair whose second
-    /// register a window hands back at every RETURN
-    /// ([`crate::kuna_returnuncomputed::narrow_window_pair`]).
-    kuna_window_pair: crate::kuna_returnuncomputed::WindowPair,
+    /// (kuna) Return recovery joined this function's two-register return value
+    /// first register low on an ABI that puts the high word first
+    /// ([`crate::kuna_bejoin::join_order`]), so its calls' pairs are joined that
+    /// way too.
+    kuna_pairs_first_low: bool,
     /// (kuna `calleevote`) The types every caller of this function passes for its
     /// inputs, copied off the `Architecture` after the flow build.
     kuna_calleevote_inputs: Option<std::rc::Rc<crate::kuna_calleevote::CallerTypes>>,
@@ -570,7 +571,7 @@ impl Funcdata {
             kuna_passthrough_claims: Vec::new(),
             kuna_passthrough_vararg_calls: Vec::new(),
             kuna_passthrough_variadic: false,
-            kuna_window_pair: crate::kuna_returnuncomputed::WindowPair::No,
+            kuna_pairs_first_low: false,
             kuna_calleevote_inputs: None,
             kuna_calleevote_closed: false,
             kuna_elemptr_blocked: None,
@@ -1094,16 +1095,16 @@ impl Funcdata {
         self.kuna_passthrough_variadic
     }
 
-    /// (kuna) Record whether the recovered output is a register-window pair
-    /// whose second register a window hands back at every RETURN.
-    pub fn kuna_set_window_pair(&mut self, v: crate::kuna_returnuncomputed::WindowPair) {
-        self.kuna_window_pair = v;
+    /// (kuna) Record that this function's return pair was joined first
+    /// register low on an ABI that puts the high word first.
+    pub fn kuna_set_pairs_first_low(&mut self, v: bool) {
+        self.kuna_pairs_first_low = v;
     }
 
-    /// (kuna) Is the recovered output a register-window pair whose second
-    /// register a window hands back at every RETURN?
-    pub fn kuna_window_pair(&self) -> crate::kuna_returnuncomputed::WindowPair {
-        self.kuna_window_pair
+    /// (kuna) Was this function's return pair joined first register low on an
+    /// ABI that puts the high word first ([`crate::kuna_bejoin::join_order`])?
+    pub fn kuna_pairs_first_low(&self) -> bool {
+        self.kuna_pairs_first_low
     }
 
     /// (kuna `retpushedhalf`) The flow build's record of registers this function
@@ -2920,7 +2921,7 @@ impl Funcdata {
         self.kuna_passthrough_claims.clear();
         self.kuna_passthrough_vararg_calls.clear();
         self.kuna_passthrough_variadic = false;
-        self.kuna_window_pair = crate::kuna_returnuncomputed::WindowPair::No;
+        self.kuna_pairs_first_low = false;
     }
 
     /// Set a delay/flag bit directly (test/seam helper; not a C++ method).

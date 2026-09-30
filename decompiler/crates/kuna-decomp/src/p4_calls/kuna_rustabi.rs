@@ -336,7 +336,7 @@ pub fn holds_scalar_pair(data: &Funcdata, vn: VarnodeId) -> bool {
         return false;
     }
     let Some((hi, lo)) = pair_pieces(data, vn, 0) else { return false };
-    let high_first = crate::kuna_returnuncomputed::first_register_holds_high(data, vn);
+    let high_first = crate::kuna_bejoin::first_register_holds_high(data, vn);
     let (second, first) = if high_first { (lo, hi) } else { (hi, lo) };
     classify_return_pair(data, second, first) == ReturnRepr::ScalarPair
 }
