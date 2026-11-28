@@ -20,7 +20,9 @@ const FF_UNKNOWN: u8 = 1;
 const FF_LIVE: u8 = 2;
 const FF_OLDER: u8 = 4;
 const WB_WINDOW: u8 = 0b111;
-const OLDER_WB: u8 = 0b110;
+const WB_AGE_ONE: u8 = 0b010;
+const WB_AGE_TWO: u8 = 0b100;
+const OLDER_WB: u8 = WB_AGE_ONE | WB_AGE_TWO;
 const ISSUE_CELLS: u16 = 0x3bff;
 
 #[derive(Clone, Copy)]
@@ -36,6 +38,8 @@ struct FfOps {
 struct DataOps {
     reserve: u64,
     commit: u64,
+    older: Option<u64>,
+    conflict: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +121,8 @@ impl<'a> PhaseDecode<'a> {
         let data = (|| Some(DataOps {
             reserve: index(b"carmel_of_reserve_word")?,
             commit: index(b"carmel_wb_data_commit")?,
+            older: index(b"carmel_of_older_wb_word"),
+            conflict: index(b"carmel_data_read_conflict"),
         }))();
         let cells = (|| Some(CellOps {
             read: index(b"carmel_read_issue_cell")?,
@@ -206,6 +212,8 @@ impl<'a> PhaseDecode<'a> {
                 repeat_writes.push(op_id);
             } else if Some(index) == self.repeat_of {
                 repeat_operand_fetches.push(op_id);
+            } else if self.data.is_some_and(|data| data.older == Some(index)) {
+                scheduled_data = true;
             } else if Some(index) == self.issue_slot {
                 slot_fetches = true;
             } else if self.data.is_some_and(|data| index == data.reserve || index == data.commit) {
@@ -232,6 +240,8 @@ impl<'a> PhaseDecode<'a> {
         if let Some(&(_, offset, _)) = markers.iter().find(|(_, _, kind)| *kind == Mark::Omitted) {
             prove_omitted_prefix(fd, visits, &markers, offset)?;
         }
+        let reset_sites: BTreeSet<_> = resets.iter()
+            .map(|&op| fd.obank().get(op).unwrap().get_addr().get_offset()).collect();
         let overlap = if resets.is_empty() {
             Overlap::default()
         } else {
@@ -290,14 +300,23 @@ impl<'a> PhaseDecode<'a> {
         let mut copies = Vec::new();
         for (marker, offset, kind) in markers {
             let modeled = delayed.get(&offset).copied();
+            if kind == Mark::DataSchedule
+                && fd.bb_op_next(marker).is_some_and(|next| overlap.claimed_wb.contains(&next))
+                && self.data.is_some_and(|data|
+                    userop(fd, fd.obank().get(marker).unwrap()) == Some(data.commit))
+            {
+                // A proved RESET window already accounts for this write and overlapping OF.
+                fd.op_destroy(marker);
+                continue;
+            }
             if kind == Mark::OperandFetch {
                 lower_operand_fetch(fd, marker, overlap.canceled.contains(&marker))?;
-            } else if matches!(kind, Mark::RegisterEx | Mark::DataEx | Mark::ResetExEnd | Mark::StagedData)
+            } else if matches!(kind, Mark::RegisterEx | Mark::DataEx | Mark::ResetExEnd)
                 || modeled == Some(false) || (kind == Mark::Slot && modeled.is_none()) {
                 fd.op_destroy(marker);
             } else if kind == Mark::Copy {
                 copies.push(marker);
-            } else if matches!(kind, Mark::Redirect | Mark::DataSchedule) {
+            } else if matches!(kind, Mark::Redirect | Mark::DataSchedule | Mark::StagedData) {
                 cleanup.push(marker);
             } else if kind == Mark::FfVisibility {
                 known.entry(offset).or_default().ff = true;
@@ -329,6 +348,11 @@ impl<'a> PhaseDecode<'a> {
             matches!(db.get_variable_value(b"carmel_entry_wb_empty", fd.get_address()), Ok(1))
         });
         let inputs = incoming_proofs(fd, visits, &blocks, &traces, issue_cells, entry_wb_empty);
+        let data_window = if scheduled_data {
+            self.plan_data_window(fd, visits, &blocks, &reset_sites, &traces)?
+        } else {
+            DataWindow::default()
+        };
         for (trace, mut proof) in traces.iter().zip(inputs.iter().copied()) {
             for &event in &trace.events {
                 match event {
@@ -352,8 +376,13 @@ impl<'a> PhaseDecode<'a> {
                     Event::IssueSlot(op) if !proof.slot_offsets.is_power_of_two() => {
                         return Err(sample_error(fd, op, "issue slot"));
                     }
-                    Event::OfWord(op) if proof.wb & OLDER_WB != 0 => {
+                    Event::OfWord(op) if proof.untyped_wb & OLDER_WB != 0
+                        || data_window.reads.get(&op).copied().unwrap_or(0) != proof.typed_wb & OLDER_WB => {
                         return Err(sample_error(fd, op, "DATA operand fetch with older writeback"));
+                    }
+                    Event::OlderWb(op) if proof.untyped_wb & WB_AGE_TWO != 0
+                        || data_window.queries.get(&op).copied() != Some(proof.typed_wb & WB_AGE_TWO != 0) => {
+                        return Err(sample_error(fd, op, "DATA age-two writeback reservation"));
                     }
                     Event::RawLoad(op) if proof.typed_wb & OLDER_WB != 0 => {
                         return Err(sample_error(fd, op, "DATA read with older writeback"));
@@ -370,6 +399,7 @@ impl<'a> PhaseDecode<'a> {
                 proof = event.advance(proof);
             }
         }
+        data_window.lower(fd)?;
         let slots = if reads {
             let scratch = self.translate.get_register_varnode(b"__CE_ADDRESS_HISTORY")
                 .map_err(|_| KunaError::lowlevel("Carmel phase history storage is missing"))?;
@@ -534,6 +564,9 @@ impl<'a> PhaseDecode<'a> {
                     trace.events.push(Event::OfWord(id));
                     fixed_bus = Some(OpCode::CPUI_LOAD);
                     data_access = fixed_bus;
+                }
+                Some(index) if self.data.is_some_and(|data| data.older == Some(index)) => {
+                    trace.events.push(Event::OlderWb(id));
                 }
                 Some(index) if self.data.is_some_and(|data| index == data.commit) => {
                     trace.events.push(Event::DataStore(true));
@@ -854,6 +887,7 @@ enum Event {
     OfWord(OpId),
     RawLoad(OpId),
     DataStore(bool),
+    OlderWb(OpId),
     OpaqueTransfer(OpId),
     Cell(OpId, u32, bool),
 }
@@ -864,21 +898,22 @@ struct Proof {
     entry_ages: u8,
     ff: u8,
     slot_offsets: u8,
-    wb: u8,
+    untyped_wb: u8,
     typed_wb: u8,
     cells: u128,
 }
 
 impl Proof {
     const ENTRY: Self = Self { age: 0, entry_ages: ANY_ENTRY_AGE, ff: FF_UNKNOWN,
-        slot_offsets: u8::MAX, wb: OLDER_WB, typed_wb: 0, cells: 0 };
+        slot_offsets: u8::MAX, untyped_wb: OLDER_WB, typed_wb: 0, cells: 0 };
     const TOP: Self = Self { age: CLOCKS, entry_ages: 0, ff: 0,
-        slot_offsets: 0, wb: 0, typed_wb: 0, cells: u128::MAX };
+        slot_offsets: 0, untyped_wb: 0, typed_wb: 0, cells: u128::MAX };
 
     fn join(self, other: Self) -> Self {
         Self { age: self.age.min(other.age), entry_ages: self.entry_ages | other.entry_ages, ff: self.ff | other.ff,
             slot_offsets: self.slot_offsets | other.slot_offsets,
-            wb: self.wb | other.wb, typed_wb: self.typed_wb | other.typed_wb,
+            untyped_wb: self.untyped_wb | other.untyped_wb,
+            typed_wb: self.typed_wb | other.typed_wb,
             cells: self.cells & other.cells }
     }
 
@@ -910,7 +945,7 @@ impl Event {
                 entry_ages: ANY_ENTRY_AGE,
                 ff: if keep_ff { proof.ff } else { FF_UNKNOWN | (proof.ff & FF_OLDER) },
                 slot_offsets: u8::MAX,
-                wb: WB_WINDOW,
+                untyped_wb: WB_WINDOW,
                 typed_wb: proof.typed_wb,
                 cells: 0,
             },
@@ -920,12 +955,12 @@ impl Event {
                 entry_ages: ((proof.entry_ages << 1) & ANY_ENTRY_AGE) | (proof.entry_ages & MATURE_ENTRY),
                 ff: if late { FF_OLDER } else { FF_LIVE },
                 slot_offsets: proof.slot_offsets.rotate_left(1),
-                wb: (proof.wb << 1) & WB_WINDOW,
+                untyped_wb: (proof.untyped_wb << 1) & WB_WINDOW,
                 typed_wb: (proof.typed_wb << 1) & WB_WINDOW,
                 cells: proof.invalidate_current_cells(known_cells),
             },
             Self::DataStore(typed) => Proof {
-                wb: proof.wb | 1,
+                untyped_wb: proof.untyped_wb | u8::from(!typed),
                 typed_wb: proof.typed_wb | u8::from(typed),
                 ..proof
             },
@@ -966,7 +1001,7 @@ fn incoming_proofs(
             // A real function entry observes its supplied register values,
             // unlike an unproved intra-function redirect or loop backedge.
             Proof { entry_ages: 1, ff: FF_LIVE, slot_offsets: 1,
-                wb: if entry_wb_empty { 0 } else { OLDER_WB },
+                untyped_wb: if entry_wb_empty { 0 } else { OLDER_WB },
                 cells: if issue_cells { u128::MAX } else { 0 }, ..Proof::ENTRY }
         } else if i == 0 || block.size_in() == 0 {
             Proof::ENTRY
@@ -1009,4 +1044,375 @@ fn copy_before(fd: &mut Funcdata, marker: OpId, source: VarnodeId, destination: 
     fd.new_varnode_out(1, destination, op)?;
     fd.op_insert_before(op, marker);
     Ok(())
+}
+
+#[derive(Default)]
+struct DataIssue {
+    incoming: Option<(OpId, OpId)>,
+    outgoing: Option<(OpId, OpId)>,
+    clock: Option<OpId>,
+    reads: [Option<(OpId, OpId)>; 2],
+    store: Option<OpId>,
+    query: Option<OpId>,
+    faults: [Option<OpId>; 2],
+    barrier: bool,
+}
+
+#[derive(Default)]
+struct DataWindow {
+    // The abstract age proof must agree with the concrete reaching STOREs.
+    reads: BTreeMap<OpId, u8>,
+    queries: BTreeMap<OpId, bool>,
+    moves: Vec<(OpId, OpId, Option<OpId>)>,
+}
+
+fn address_of(fd: &Funcdata, id: OpId) -> &Address {
+    fd.obank().get(id).unwrap().get_addr()
+}
+
+fn record_one<T>(slot: &mut Option<T>, value: T, barrier: &mut bool) {
+    *barrier |= slot.replace(value).is_some();
+}
+
+fn data_edge(fd: &Funcdata, issues: &mut BTreeMap<u64, DataIssue>, from: OpId, to: OpId) {
+    let (from_addr, to_addr) = (address_of(fd, from), address_of(fd, to));
+    if from_addr != to_addr {
+        let edge = (from, to);
+        let issue = issues.entry(from_addr.get_offset()).or_default();
+        record_one(&mut issue.outgoing, edge, &mut issue.barrier);
+        let issue = issues.entry(to_addr.get_offset()).or_default();
+        record_one(&mut issue.incoming, edge, &mut issue.barrier);
+    }
+}
+
+fn preceding_op(fd: &Funcdata, a: OpId, b: OpId) -> bool {
+    let (left, right) = (fd.obank().get(a).unwrap(), fd.obank().get(b).unwrap());
+    if left.get_parent() != right.get_parent() {
+        return fd.bblocks_ref().dominates(left.get_parent().unwrap(), right.get_parent());
+    }
+    let mut next = fd.bb_op_next(a);
+    while let Some(op) = next {
+        if op == b { return true; }
+        next = fd.bb_op_next(op);
+    }
+    false
+}
+
+// Check possible (not just dominating) paths to a closed arbitration stop.
+// The source ops cannot be in the stop's own two-op block.
+fn fault_follows(fd: &Funcdata, fault: OpId, sources: impl Iterator<Item = OpId> + Clone) -> bool {
+    let graph = fd.bblocks_ref();
+    let address = address_of(fd, fault);
+    let stop = fd.obank().get(fault).unwrap().get_parent().unwrap();
+    let mut seen = BTreeSet::from([stop]);
+    let mut pending = vec![stop];
+    while let Some(block) = pending.pop() {
+        let edges = graph.block(block);
+        for edge in 0..edges.size_in() {
+            let prior = edges.get_in(edge);
+            if fd.bb_op_tail(prior).is_some_and(|tail| address_of(fd, tail) == address)
+                && seen.insert(prior) {
+                if sources.clone().any(|id| fd.obank().get(id).unwrap().get_parent() == Some(prior)) {
+                    return true;
+                }
+                // A block may contain the preceding issue's tail as well as
+                // this issue's entry; do not walk past that entry.
+                if fd.bb_op_head(prior).is_some_and(|head| address_of(fd, head) == address) {
+                    pending.push(prior);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn pcode_size(fd: &Funcdata, vn: Option<VarnodeId>, size: i32) -> bool {
+    vn.and_then(|id| fd.vbank().get(id)).is_some_and(|vn| vn.get_size() == size)
+}
+
+fn pcode_constant(fd: &Funcdata, vn: Option<VarnodeId>, value: u64) -> bool {
+    vn.and_then(|id| fd.vbank().get(id))
+        .is_some_and(|vn| vn.is_constant() && vn.get_offset() == value)
+}
+
+fn same_word(fd: &Funcdata, a: Option<VarnodeId>, b: Option<VarnodeId>) -> bool {
+    a.and_then(|id| fd.vbank().get(id)).zip(b.and_then(|id| fd.vbank().get(id)))
+        .is_some_and(|(a, b)| a.get_size() == 2 && b.get_size() == 2 && a.get_addr() == b.get_addr())
+}
+
+impl PhaseDecode<'_> {
+    fn data_clock(&self, index: u64) -> bool {
+        index == self.tick || self.idle_tick == Some(index)
+            || self.cells.is_some_and(|cells| cells.tick == index)
+    }
+
+    fn data_access(&self, fd: &Funcdata, id: OpId, space: u64, write: bool) -> Option<OpId> {
+        let mark = fd.obank().get(id)?;
+        let mut next = fd.bb_op_next(id)?;
+        if write && self.staged_data.is_some()
+            && userop(fd, fd.obank().get(next)?) == self.staged_data {
+            next = fd.bb_op_next(next)?;
+        }
+        let op = fd.obank().get(next)?;
+        let kind = if write { OpCode::CPUI_STORE } else { OpCode::CPUI_LOAD };
+        (mark.num_input() == if write { 4 } else { 3 }
+            && mark.get_out().is_none()
+            && pcode_size(fd, mark.get_in(if write { 3 } else { 2 }), 1)
+            && pcode_constant(fd, mark.get_in(if write { 3 } else { 2 }), 1)
+            && op.get_addr() == mark.get_addr() && op.code() == kind
+            && pcode_constant(fd, op.get_in(0), space)
+            && same_word(fd, mark.get_in(1), op.get_in(1))
+            && if write { same_word(fd, mark.get_in(2), op.get_in(2)) }
+                else { pcode_size(fd, op.get_out(), 2) }).then_some(next)
+    }
+
+    fn plan_data_window(
+        &self, fd: &Funcdata, visits: &VisitedMap, blocks: &[BlockId], resets: &BTreeSet<u64>,
+        traces: &[Trace],
+    ) -> KunaResult<DataWindow> {
+        let mut plan = DataWindow::default();
+        if !traces.iter().any(|trace| trace.events.iter()
+            .any(|event| matches!(event, Event::OfWord(_) | Event::OlderWb(_)))) {
+            return Ok(plan);
+        }
+        let data = self.data.unwrap();
+        let space = fd.get_arch().manage().get_space_by_name("data")
+            .ok_or_else(|| KunaError::lowlevel("Missing Carmel DATA space"))?.get_index() as u64;
+        let graph = fd.bblocks_ref();
+        let mut issues = BTreeMap::<u64, DataIssue>::new();
+        for &block in blocks {
+            let mut previous = None;
+            let mut current = fd.bb_op_head(block);
+            while let Some(id) = current {
+                let op = fd.obank().get(id).unwrap();
+                if let Some(prior) = previous {
+                    data_edge(fd, &mut issues, prior, id);
+                }
+                let offset = op.get_addr().get_offset();
+                let issue = issues.entry(offset).or_default();
+                let marker = userop(fd, op);
+                issue.barrier |= op.get_halt_type() != 0 || exits_issue(fd, op) || resets.contains(&offset)
+                    || (0..op.num_input()).filter_map(|i| op.get_in(i)).chain(op.get_out())
+                        .filter_map(|vn| fd.vbank().get(vn))
+                        .any(|vn| !vn.is_constant() && !matches!(vn.get_space().get_name(), "register" | "unique"));
+                match op.code() {
+                    OpCode::CPUI_CALLOTHER => match marker {
+                        Some(index) if self.data_clock(index) => record_one(&mut issue.clock, id, &mut issue.barrier),
+                        Some(index) if index == data.reserve => {
+                            if let Some((slot, access)) = issue.reads.iter_mut().find(|slot| slot.is_none())
+                                .zip(self.data_access(fd, id, space, false)) {
+                                *slot = Some((id, access));
+                            } else {
+                                issue.barrier = true;
+                            }
+                        }
+                        Some(index) if index == data.commit => {
+                            if let Some(store) = self.data_access(fd, id, space, true) {
+                                record_one(&mut issue.store, store, &mut issue.barrier);
+                            } else {
+                                issue.barrier = true;
+                            }
+                        }
+                        Some(index) if data.older == Some(index) && op.num_input() == 1
+                            && pcode_size(fd, op.get_out(), 4) => {
+                            record_one(&mut issue.query, id, &mut issue.barrier);
+                        }
+                        Some(index) if data.conflict == Some(index) && op.num_input() == 1
+                            && op.get_out().is_none() => {
+                            if let Some(slot) = issue.faults.iter_mut().find(|slot| slot.is_none()) {
+                                *slot = Some(id);
+                            } else {
+                                issue.barrier = true;
+                            }
+                        }
+                        Some(index) if self.staged_data == Some(index) && op.num_input() == 1
+                            && op.get_out().is_none() => {}
+                        _ => issue.barrier = true,
+                    },
+                    OpCode::CPUI_LOAD => issue.barrier |= !issue.reads.iter().flatten().any(|&(_, read)| read == id),
+                    OpCode::CPUI_STORE => issue.barrier |= issue.store != Some(id),
+                    _ => {}
+                }
+                previous = current;
+                current = fd.bb_op_next(id);
+            }
+            let Some(tail) = previous else { continue };
+            let edges = graph.block(block);
+            for edge in 0..edges.size_out() {
+                let target = edges.get_out(edge);
+                let Some(head) = fd.bb_op_head(target) else {
+                    issues.get_mut(&address_of(fd, tail).get_offset()).unwrap().barrier = true;
+                    continue;
+                };
+                if address_of(fd, tail) != address_of(fd, head) {
+                    data_edge(fd, &mut issues, tail, head);
+                } else if edges.get_index() >= graph.block(target).get_index() {
+                    let issue = issues.get_mut(&address_of(fd, tail).get_offset()).unwrap();
+                    // The DSP port stop is terminal for this execution. It is
+                    // the only permitted intrainstruction back edge.
+                    issue.barrier |= target != block || edges.size_out() != 1
+                        || !issue.faults.contains(&Some(head)) || fd.bb_op_next(head) != Some(tail)
+                        || fd.obank().get(tail).unwrap().code() != OpCode::CPUI_BRANCH;
+                }
+            }
+            if edges.size_out() == 0 {
+                issues.get_mut(&address_of(fd, tail).get_offset()).unwrap().barrier = true;
+            }
+        }
+        for issue in issues.values_mut() {
+            issue.barrier |= !issue.proves_clock(fd, visits);
+            if !issue.barrier {
+                if let Some(query) = issue.query {
+                    plan.queries.insert(query, false);
+                }
+            }
+        }
+
+        let next = |issue: &DataIssue| {
+            let (tail, head) = issue.outgoing?;
+            let (from, to) = (address_of(fd, tail), address_of(fd, head));
+            let younger = issues.get(&to.get_offset())?;
+            (!issue.barrier && !younger.barrier && younger.incoming == Some((tail, head))
+                && to != fd.get_address() && from.get_offset() < to.get_offset()
+                && contiguous(visits, from, to)).then_some(younger)
+        };
+        let mut defer = BTreeSet::new();
+        // Iterate by address only to keep the proved forward moves ordered;
+        // the two clock advances themselves come exclusively from CFG edges.
+        for issue in issues.values() {
+            let Some(store) = issue.store else { continue };
+            let ordered = defer.remove(&store);
+            let window = next(issue).and_then(|one| next(one).map(|two| (one, two)));
+            let Some((one, two)) = window else {
+                if ordered { return Err(sample_error(fd, store, "ordered DATA writeback drain")); }
+                continue;
+            };
+            if !ordered && one.reads[0].is_none() && two.reads[0].is_none() { continue; }
+            if two.reads[0].is_some() && two.query.is_none() {
+                return Err(sample_error(fd, store, "guarded DATA age-two writeback"));
+            }
+            let drain = two.clock.unwrap();
+            if !preceding_op(fd, store, drain)
+                || two.query.is_some_and(|query| !preceding_op(fd, store, query))
+                || [one, two].into_iter().flat_map(|younger| younger.reads.iter().flatten())
+                    .any(|&(_, load)| !preceding_op(fd, store, load)) {
+                return Err(sample_error(fd, store, "dominating DATA writeback"));
+            }
+            for (younger, age) in [(one, WB_AGE_ONE), (two, WB_AGE_TWO)] {
+                for &(mark, _) in younger.reads.iter().flatten() {
+                    *plan.reads.entry(mark).or_default() |= age;
+                }
+                if let Some(next_store) = younger.store {
+                    defer.insert(next_store);
+                }
+            }
+            if let Some(query) = two.query {
+                plan.queries.insert(query, true);
+            }
+            plan.moves.push((store, drain, two.query));
+        }
+        Ok(plan)
+    }
+}
+
+impl DataIssue {
+    fn proves_clock(&self, fd: &Funcdata, visits: &VisitedMap) -> bool {
+        let Some(clock) = self.clock else { return false };
+        let Some((tail, next)) = self.outgoing else { return false };
+        let at = address_of(fd, clock);
+        if !visits.get(at).is_some_and(|visit| matches!(visit.size, 3 | 6))
+            || !contiguous(visits, at, address_of(fd, next))
+            || (at == fd.get_address() && self.incoming.is_some())
+            || (tail != clock && !preceding_op(fd, clock, tail))
+            || self.store.is_some_and(|store| !preceding_op(fd, store, clock)
+                || self.reads[0].is_some() || self.faults[0].is_some()) {
+            return false;
+        }
+        let reads = self.reads.iter().flatten().count();
+        let mut pure_guard = false;
+        let mut mixed_guard = false;
+        for &fault in self.faults.iter().flatten() {
+            let block = fd.obank().get(fault).unwrap().get_parent().unwrap();
+            let edges = fd.bblocks_ref().block(block);
+            if fd.bb_op_head(block) != Some(fault) || edges.size_out() != 1 || edges.get_out(0) != block
+                || fault_follows(fd, fault, self.reads.iter().flatten().map(|&(_, load)| load)) {
+                return false;
+            }
+            let seen = if self.query.is_some_and(|query| preceding_op(fd, query, fault)) {
+                &mut mixed_guard
+            } else {
+                // The pure-read stop must be reachable before, never after,
+                // the separate mixed guard that consumes the query.
+                if self.query.is_some_and(|query| fault_follows(fd, fault, std::iter::once(query))) {
+                    return false;
+                }
+                &mut pure_guard
+            };
+            if std::mem::replace(seen, true) { return false; }
+        }
+        (reads == 2) == pure_guard && self.query.is_some() == mixed_guard
+            && (self.query.is_none() || reads != 0)
+            && self.reads.iter().flatten().all(|&(mark, load)| preceding_op(fd, load, clock)
+                && self.query.is_none_or(|query| preceding_op(fd, query, mark)))
+    }
+}
+
+impl DataWindow {
+    fn lower(self, fd: &mut Funcdata) -> KunaResult<()> {
+        for (query, has_store) in self.queries {
+            if !has_store {
+                let zero = fd.new_constant(4, 0);
+                fd.op_set_input(query, zero, 0)?;
+                fd.op_set_opcode(query, type_op_for(OpCode::CPUI_COPY));
+            }
+        }
+        for (store, drain, query) in self.moves {
+            let addr = capture_data_word(fd, store, 1)?;
+            let value = capture_data_word(fd, store, 2)?;
+            fd.op_set_input(store, addr, 1)?;
+            fd.op_set_input(store, value, 2)?;
+            if let Some(query) = query {
+                let address = fd.vbank().get(addr).unwrap();
+                let tagged = if address.is_constant() {
+                    fd.new_constant(4, 0x10000 | address.get_offset())
+                } else {
+                    let at = address_of(fd, store).clone();
+                    let extend = fd.new_op(1, at.clone());
+                    fd.op_set_opcode(extend, type_op_for(OpCode::CPUI_INT_ZEXT));
+                    fd.op_set_input(extend, addr, 0)?;
+                    let raw = fd.new_unique_out(4, extend)?;
+                    fd.op_insert_before(extend, store);
+                    let tag = fd.new_op(2, at);
+                    let valid = fd.new_constant(4, 0x10000);
+                    fd.op_set_opcode(tag, type_op_for(OpCode::CPUI_INT_OR));
+                    fd.op_set_input(tag, raw, 0)?;
+                    fd.op_set_input(tag, valid, 1)?;
+                    let tagged = fd.new_unique_out(4, tag)?;
+                    fd.op_insert_before(tag, store);
+                    tagged
+                };
+                fd.op_set_input(query, tagged, 0)?;
+                fd.op_set_opcode(query, type_op_for(OpCode::CPUI_COPY));
+            }
+            // The guarded LOADs now run before publication. The common clock
+            // is unreachable on a physical port stop, so it suppresses WB too.
+            fd.op_uninsert(store);
+            fd.op_insert_before(store, drain);
+        }
+        Ok(())
+    }
+}
+
+fn capture_data_word(fd: &mut Funcdata, before: OpId, slot: i32) -> KunaResult<VarnodeId> {
+    let value = fd.obank().get(before).unwrap().get_in(slot).unwrap();
+    if fd.vbank().get(value).unwrap().is_constant() { return Ok(value); }
+    // Free inputs belong to one operation until heritage. Move the use into
+    // the capture first; only the capture's written output can be shared.
+    fd.op_unset_input(before, slot);
+    let copy = fd.new_op(1, address_of(fd, before).clone());
+    fd.op_set_opcode(copy, type_op_for(OpCode::CPUI_COPY));
+    fd.op_set_input(copy, value, 0)?;
+    let out = fd.new_unique_out(2, copy)?;
+    fd.op_insert_before(copy, before);
+    Ok(out)
 }

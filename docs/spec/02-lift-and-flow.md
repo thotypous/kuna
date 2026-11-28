@@ -4184,6 +4184,14 @@ write becomes visible. The scheduled DATA lift refuses an unproved overlap
 between operand fetch and an older store rather than reading already-written
 DATA.
 
+In a proved straight-line DATA window, operand fetch one or two issues after
+a word store still reads the old word. At a distance of two, the read and
+write reservations nevertheless share the same physical buses. The lift
+checks those reservations before moving the store past the younger read.
+At a distance of three, the read observes the published word. The ordering
+preserves consecutive stores and suppresses an unpublished write if the
+competing operand fetch stops.
+
 Qualified rounded multiply separates address admission from result enable.
 The first five issues use explicit incoming admission samples; after five
 proved clocks the sample comes from the preceding issue history. An admitted

@@ -224,6 +224,7 @@ define pcodeop carmel_fixed_read_admission;
 define pcodeop carmel_single_data_load;
 define pcodeop carmel_single_data_store;
 define pcodeop carmel_of_reserve_word;
+define pcodeop carmel_of_older_wb_word;
 define pcodeop carmel_wb_data_commit;
 define pcodeop carmel_end_unmodeled_issue;
 define pcodeop carmel_omitted_sequential_slot;
@@ -8423,6 +8424,56 @@ macro compact_pair_read_check(first, second) {
   <fetch>
 }
 
+macro compact_data_mixed_check(older, first, second) {
+    if ((older & 0x10000) == 0) goto <done>;
+    local write_addr:2 = older:2;
+    # Each physical DATA bus can carry at most two words.
+    if ((((first ^ write_addr) | (second ^ write_addr)) & 0x8000) == 0) goto <stopped>;
+    local bank:2 = write_addr & 0xc000;
+    # The middle quarters have one port per parity; the outer quarters do not.
+    if (bank == 0 || bank == 0xc000) goto <done>;
+    if (((first ^ write_addr) & 0xc001) == 0) goto <stopped>;
+    if (((second ^ write_addr) & 0xc001) != 0) goto <done>;
+  <stopped>
+    carmel_data_read_conflict();
+    goto <stopped>;
+  <done>
+}
+
+macro compact_word_subtract_address(first, second) {
+    first = R1;
+    second = R2;
+    modify_native_agu(R1, 1:2, RM0, RL0, RM0_ALIGN, 2:4, 4:2);
+    compact_pair_read_check(first, second);
+}
+
+:SUB "A1H","*R1++","*R2" "||" nop_right is
+    (carmel_issue=1 & slot_mode=0 & slot_0_22=0x1cc44 & carmel_phase_emit=0); (slot_mode=0 & nop_right) {
+    local first:2;
+    local second:2;
+    compact_word_subtract_address(first, second);
+    local left:2 = *[data]:2 first;
+    local right:2 = *[data]:2 second;
+    wide_sub_word(left, right, 0:1, A1H);
+}
+
+:SUB "A1H","*R1++","*R2" "||" nop_right is
+    (carmel_issue=1 & slot_mode=0 & slot_0_22=0x1cc44
+     & carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions=0 & ce_single_tick);
+    (slot_mode=0 & nop_right) {
+    local first:2;
+    local second:2;
+    compact_word_subtract_address(first, second);
+    local older:4 = carmel_of_older_wb_word();
+    compact_data_mixed_check(older, first, second);
+    local left:2;
+    local right:2;
+    phase_of_data_word(first, left);
+    phase_of_data_word(second, right);
+    wide_sub_word(left, right, 0:1, A1H);
+    build ce_single_tick;
+}
+
 # D2 reserves both reads and updates R3. OF latches X even if EX is vetoed.
 # The repeat's count samples R3 separately, after the next D2.
 macro compact_repeat_multiply(gate, cfg, bank, shift, x) {
@@ -15372,6 +15423,18 @@ staged_wb_data: is carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions
     local value:2 = literal_word s>> ((ECFG >> 5) & 1);
     build staged_wb_data;
     *[data]:2 address = value;
+}
+
+:MOVE "*R0",literal_word is carmel_issue=5 & wide_left_mode=1 & wide_right_mode=1
+    & wide_2_11=0x0 & wide_14_22=0x119 & literal_word & staged_wb_data & ce_single_tick
+    & carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions=0 {
+    local address:2 = R0;
+    local value:2 = literal_word s>> ((ECFG >> 5) & 1);
+    carmel_wb_data_commit(address, value, 1:1);
+    build staged_wb_data;
+    *[data]:2 address = value;
+    clock_ce();
+    build ce_single_tick;
 }
 :MOVE "*R0",literal_word ";" "MOVE" data_load_dst,"*"^absolute_data_addr is carmel_single_issue=0 & carmel_issue=5 & wide_left_mode=1 & wide_right_mode=1 & wide_2_11=0x0 & wide_14_22=0x119 & literal_word ; (data_load_dst & absolute_data_addr) { local read_addr:2 = absolute_data_addr; local read_value:2 = *[data]:2 read_addr; local address:2 = R0; local value:2 = literal_word s>> ((ECFG >> 5) & 1); *[data]:2 address = value; data_load_dst = read_value; }
 :MOVE "*R0++",literal_word is carmel_issue=5 & wide_left_mode=1 & wide_right_mode=1 & wide_2_11=0x10 & wide_14_22=0x119 & literal_word { local address:2 = R0; modify_ptr(R0, RN0, RM0, RL0, 0, 2); local value:2 = literal_word s>> ((ECFG >> 5) & 1); *[data]:2 address = value; }

@@ -40,6 +40,7 @@ pub(super) enum AddressAdmission {
 pub(super) struct Overlap {
     pub canceled: BTreeSet<OpId>,
     pub admission: BTreeMap<OpId, AddressAdmission>,
+    pub claimed_wb: BTreeSet<OpId>,
 }
 
 type IssueEdges<'a> = BTreeMap<u64, Option<&'a Address>>;
@@ -180,6 +181,9 @@ pub(super) fn lower_control(fd: &mut Funcdata, visits: &VisitedMap, resets: &[Op
         if !proved {
             return Err(KunaError::lowlevel(format!("Unproved Carmel RESET retirement window at CODE {:#x}",
                                                   address.get_offset() / 3)));
+        }
+        if let Some(mark) = wb {
+            overlap.claimed_wb.insert(mark);
         }
         match execute {
             Some(Execute::AddressOnly(mark)) => {

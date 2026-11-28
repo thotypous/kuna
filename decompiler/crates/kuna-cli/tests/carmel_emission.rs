@@ -10577,3 +10577,69 @@ int main(void) {
     fs::write(&source, &c).unwrap();
     run_emitted_c(&source, &executable, &c);
 }
+
+#[test]
+fn carmel_data_of_sees_old_word_until_wb_drains() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    const NOP: [u8; 6] = [0x2b, 0xec, 0, 0x2b, 0xec, 0];
+    const RET: [u8; 6] = [0x2b, 0xd8, 0, 0x2b, 0xec, 0];
+    const STORE: [u8; 6] = [0x80, 0x56, 0x78, 0xc6, 0x40, 0];
+    const STORE2: [u8; 6] = [0x80, 0x9a, 0xbc, 0xc6, 0x40, 0];
+    const SUB: [u8; 6] = [0x01, 0xcc, 0x44, 0x2b, 0xec, 0];
+    let scratch = tempfile::tempdir().unwrap();
+    let binary = scratch.path().join("data-wb.bin");
+    let source = scratch.path().join("data-wb.c");
+    let mut c = String::from("#include <stdbool.h>\n#include <stdint.h>\n#include <setjmp.h>\n\
+        static jmp_buf stop;\n\
+        static _Noreturn void carmel_data_read_conflict(void) { longjmp(stop,1); }\n\
+        static volatile unsigned short write_word, left_word, right_word;\n");
+    let mut calls = String::from("int main(void) {\n");
+    for (i, (prefix, store_at, read_at, result, stored)) in [
+        (&[STORE, SUB][..], 0xc145, 0xc145, Some(0x8888_u16), 0x5678),
+        (&[STORE, NOP, SUB][..], 0xc145, 0xc145, Some(0x8888), 0x5678),
+        (&[STORE, NOP, NOP, SUB][..], 0xc145, 0xc145, Some(0x3456), 0x5678),
+        (&[STORE, NOP, SUB][..], 0x8120, 0x8122, None, 0xaaaa),
+        (&[STORE, STORE2, NOP, SUB][..], 0xc145, 0xc145, Some(0x3456), 0x9abc),
+    ].into_iter().enumerate() {
+        let mut code = Vec::from([NOP; 3]);
+        code.extend(prefix);
+        code.extend([NOP; 10]);
+        code.push(RET);
+        fs::write(&binary, code.as_flattened()).unwrap();
+        let specs = scratch.path().join(format!("row-{i}"));
+        tracked_carmel_entry_specs(&specs, &[
+            ("R0", store_at), ("R1", read_at), ("R2", 0x0100), ("ECFG", 0), ("A1H", 0x1155),
+            ("PACFG", 0), ("RM0", 0), ("RL0", 0), ("RM0_ALIGN", 0xffff),
+        ], 0, 0);
+        let mut kuna = Command::new(env!("CARGO_BIN_EXE_kuna"));
+        kuna.env("KUNA_SPECS", &specs).arg("decompile").arg(&binary).args([
+            "0", "--addr", "--raw-image", "--target", "Carmel:BE:24:default:default", "--base", "0",
+            "--json", "--assert-strict", "--assert", "return %A1H unsigned short",
+            "--assert", &format!("data [data,{store_at:#x}] volatile unsigned short write_word"),
+            "--assert", "data [data,0x0100] volatile unsigned short right_word",
+        ]);
+        if read_at != store_at {
+            kuna.args(["--assert", &format!("data [data,{read_at:#x}] volatile unsigned short left_word")]);
+        }
+        let out = common::process::required_output(&mut kuna);
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let function = &doc["functions"][0];
+        assert!(function["error"].is_null(), "{function}");
+        let text = function["code"].as_str().unwrap();
+        assert!(!text.contains("halt_"), "{text}");
+        writeln!(c, "#define sub_0 region_{i}\n{text}\n#undef sub_0").unwrap();
+        writeln!(calls, "write_word=left_word=0xaaaa; right_word=0x2222;").unwrap();
+        if let Some(result) = result {
+            writeln!(calls, "if (setjmp(stop) != 0 || region_{i}() != {result:#x}) return {};", i + 1).unwrap();
+        } else {
+            writeln!(calls, "if (setjmp(stop) == 0) {{ (void)region_{i}(); return {}; }}", i + 1).unwrap();
+        }
+        writeln!(calls, "if (write_word != {stored:#x} || right_word != 0x2222) return {};", i + 10).unwrap();
+    }
+    c.push_str(&calls);
+    c.push_str("return 0;\n}\n");
+    fs::write(&source, &c).unwrap();
+    run_emitted_c(&source, &scratch.path().join("data-wb"), &c);
+}
