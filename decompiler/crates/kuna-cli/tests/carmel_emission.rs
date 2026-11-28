@@ -10755,3 +10755,162 @@ fn carmel_wide_ashift_samples_both_words_before_postmodify_and_writes_saved_lc1(
     fs::write(&source, &c).unwrap();
     run_emitted_c(&source, &exe, &c);
 }
+
+#[test]
+fn carmel_single_word_saved_lc1_uses_live_carry_and_the_old_data_address() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    const NOP: [u8; 6] = [0x2b, 0xec, 0, 0x2b, 0xec, 0];
+    const RETURN: [u8; 6] = [0x2b, 0xd8, 0, 0x2b, 0xec, 0];
+    let temp = tempfile::tempdir().unwrap();
+    let [binary, specs, source, exe] = ["saved.bin", "specs", "saved.c", "saved.exe"]
+        .map(|name| temp.path().join(name));
+    tracked_carmel_entry_specs(&specs, &[
+        ("R1", 0x4040), ("R7", 0xc048), ("RN2", 3), ("A1L", 1), ("A4L", 0x7135),
+        ("LC", 0x6263), ("EST", 0), ("PACFG", 0), ("RM0", 0), ("RL0", 0), ("RM6", 0), ("RL6", 0),
+        ("ECFG", 0), ("CECFG1", 0x1000), ("CECFG2", 0x1000), ("CETBL", 0xffff),
+    ], 0, 0);
+    let mut c = String::from("#include <stdint.h>\n#include <stdbool.h>\nvolatile unsigned short cell;\n");
+    let mut calls = String::from("int main(void) {\n");
+    for (i, (compare, operation, address, reg, cases)) in [
+        ([0x20, 0xba, 2, 0x2b, 0xec, 0], [0x91, 0x95, 0x67, 0xf1, 0xa9, 0x54], 0x4040_u16, "R1",
+            [(0, 0, 3, 0x3000), (2, 0, 3, 0x3001), (2, 1, 6, 0x3000), (0, 0x7f, 1, 0x3001)]),
+        ([0x2b, 0xec, 0, 0x20, 0xba, 2], [0x97, 0x97, 9, 0x9b, 0xa9, 0x28], 0xc048, "R7",
+            [(0, 0, 0x7135, 0x3000), (2, 0, 0x7136, 0x3040),
+                (0, 0x7fff, 0xf134, 0x3024), (2, 0x8000, 0xf136, 0x3050)]),
+    ].into_iter().enumerate() {
+        let mut issues = vec![NOP; 3];
+        issues.extend([compare, operation]);
+        issues.extend([NOP; 6]);
+        issues.push(RETURN);
+        fs::write(&binary, issues.as_flattened()).unwrap();
+        for (name, output) in [("result", "LC1"), ("flags", "EST"), ("pointer", reg), ("active", "LC")] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuna"));
+            cmd.env("KUNA_SPECS", &specs).arg("decompile").arg(&binary).args([
+                "0", "--addr", "--raw-image", "--base", "0", "--target", "Carmel:BE:24:default:default",
+                "--assert-strict", "--assert", &format!("return %{output} unsigned short"),
+                "--assert", "param 0 %A0L unsigned short compare",
+                "--assert", &format!("data [data,{address:#x}] volatile unsigned short cell"),
+            ]);
+            let out = common::process::required_output(&mut cmd);
+            let emitted = String::from_utf8(out.stdout).unwrap();
+            writeln!(c, "#define sub_0 {name}_{i}\n{emitted}\n#undef sub_0").unwrap();
+        }
+        for (j, (compare, word, result, flags)) in cases.into_iter().enumerate() {
+            writeln!(calls, "cell = {word:#x}; if (result_{i}({compare}) != {result:#x} || flags_{i}({compare}) != {flags:#x} ||\
+                pointer_{i}({compare}) != {:#x} || active_{i}({compare}) != 0x6263 || cell != {word:#x}) return {};",
+                address + 1, 1 + i * 4 + j).unwrap();
+        }
+    }
+    c.push_str(&calls);
+    c.push_str("return 0;\n}\n");
+    fs::write(&source, &c).unwrap();
+    run_emitted_c(&source, &exe, &c);
+}
+
+#[test]
+fn carmel_wide_xor_rmw_reserves_all_of_words_before_writeback() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    const NOP: [u8; 6] = [0x2b, 0xec, 0, 0x2b, 0xec, 0];
+    const RET: [u8; 6] = [0x2b, 0xd8, 0, 0x2b, 0xec, 0];
+    const STORE: [u8; 6] = [0x80, 0x56, 0x78, 0xc6, 0x40, 0];
+    const R4_PAIR: [u8; 6] = [0x94, 0xcd, 0x6a, 0xe8, 0x10, 0x8d];
+    const R4_WORD: [u8; 6] = [0x84, 0xcd, 0x6a, 0xe8, 0x70, 0x8c];
+    const R5_PAIR: [u8; 6] = [0x95, 0xcd, 0x6a, 0xe8, 0x70, 0x8d];
+    const NEG_DISP: [u8; 6] = [0x94, 0xcd, 0x8a, 0xe8, 0x10, 0x8d];
+    const BASE: u32 = 0x1000;
+    let scratch = tempfile::tempdir().unwrap();
+    let [binary, source, executable] = ["wide-xor.bin", "wide-xor.c", "wide-xor"]
+        .map(|name| scratch.path().join(name));
+    let mut c = String::from("#include <stdbool.h>\n#include <stdint.h>\n#include <setjmp.h>\n\
+        #define CONCAT22(h,l) (((uint32_t)(uint16_t)(h) << 16) | (uint16_t)(l))\n\
+        static jmp_buf stop;\n\
+        static _Noreturn void carmel_data_read_conflict(void) { longjmp(stop, 1); }\n\
+        static volatile unsigned short first, dst, r4_dec, r4_upper, r4_inc, r5_word, r5_upper, r5_inc, older_word;\n");
+    let mut calls = String::from("int main(void) {\n");
+    // The three DATA routes each run with both CE tables. The result is not
+    // predicated, and only the pair with an upper sign bit sets E1.
+    let rows = [
+        (R4_PAIR, 0, 0xc0aau16, 0, None, Some((0x4a, 0x4048, 0x0020, 0x5df9))),
+        (R4_PAIR, 0xffff, 0xc0aa, 0, None, Some((0x4a, 0x4048, 0x3020, 0x5df9))),
+        (R4_WORD, 0, 0xc0aa, 0, None, Some((0x47, 0x4048, 0x0000, 0x5df9))),
+        (R4_WORD, 0xffff, 0xc0aa, 0, None, Some((0x47, 0x4048, 0x3000, 0x5df9))),
+        (R5_PAIR, 0, 0xc0aa, 0, None, Some((0x47, 0x404a, 0x0000, 0x71bb))),
+        (R5_PAIR, 0xffff, 0xc0aa, 0, None, Some((0x47, 0x404a, 0x3000, 0x71bb))),
+        (NEG_DISP, 0, 0xc0aa, 0xff, None, Some((0x4a, 0x4048, 0x0020, 0x5d06))),
+        (R4_WORD, 0, 0xc0aa, 0x5df9, None, Some((0x47, 0x4048, 0x0008, 0))),
+        (R5_PAIR, 0, 0xc0aa, 0, Some((0x4048, 1)), Some((0x47, 0x404a, 0, 0x71bb))),
+        (R5_PAIR, 0, 0xc0aa, 0, Some((0x4048, 3)), Some((0x47, 0x404a, 0, 0x5678))),
+        // The pair already uses both ports on the older store's bus.
+        (R5_PAIR, 0, 0xc0aa, 0, Some((0x0050, 2)), None),
+        // Only one read shares the WB bus, but uses its interleaved bank and parity.
+        (R5_PAIR, 0, 0x8042, 0, Some((0x8044, 2)), None),
+        // Three reads on one bus stop even with no older write.
+        (R5_PAIR, 0, 0x4050, 0, None, None),
+    ];
+    for (i, (packet, table, first, left, older, expected)) in rows.into_iter().enumerate() {
+        let mut code = vec![NOP; 3];
+        if let Some((_, distance)) = older {
+            code.push(STORE);
+            code.extend(std::iter::repeat_n(NOP, distance - 1));
+        }
+        code.push(packet);
+        code.extend([NOP; 15]);
+        code.extend([RET, NOP, NOP]);
+        fs::write(&binary, code.as_flattened()).unwrap();
+        let specs = scratch.path().join(format!("xor-{i}-specs"));
+        let store_at = older.map_or(0x0050, |(addr, _)| addr);
+        let r3 = first.wrapping_sub_signed(i16::from(packet[2] as i8));
+        tracked_carmel_entry_specs(&specs, &[
+            ("R0", store_at), ("R3", r3), ("R4", 0x48), ("R5", 0x4048),
+            ("PACFG", 0), ("RM4", 0), ("RL4", 0), ("RM4_ALIGN", 0xffff),
+            ("ECFG", 0), ("EST", 0), ("FFTV", 0), ("CECFG1", 0x1000),
+            ("CECFG2", 0x1000), ("CETBL", table),
+        ], BASE, 0);
+        let (r4, r5, est, dst) = expected.unwrap_or((0, 0, 0, 0x5df9));
+        let outputs = [("EST", est), ("R4", r4), ("R5", r5)];
+        let count = if expected.is_some() { outputs.len() } else { 1 };
+        for &(reg, want) in &outputs[..count] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuna"));
+            cmd.env("KUNA_SPECS", &specs).arg("decompile").arg(&binary).args([
+                "0x1000", "--addr", "--raw-image", "--base", "0x1000",
+                "--target", "Carmel:BE:24:default:default", "--json", "--assert-strict",
+                "--assert", &format!("return %{reg} unsigned short"),
+            ]);
+            for (addr, name) in [
+                (first, "first"), (0x48, "dst"), (0x47, "r4_dec"), (0x49, "r4_upper"),
+                (0x4a, "r4_inc"), (0x4048, "r5_word"), (0x4049, "r5_upper"), (0x404a, "r5_inc"),
+            ].into_iter().chain((store_at != 0x4048).then_some((store_at, "older_word"))) {
+                cmd.args(["--assert", &format!("data [data,{addr:#x}] volatile unsigned short {name}")]);
+            }
+            let output = common::process::required_output(&mut cmd);
+            let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let f = &doc["functions"][0];
+            assert!(f["error"].is_null(), "{i} {reg}: {f}");
+            let text = f["code"].as_str().unwrap();
+            assert!(!text.contains("halt_"), "{text}");
+            let symbol = f["name"].as_str().unwrap();
+            let name = format!("xor_{i}_{}", reg.to_ascii_lowercase());
+            writeln!(c, "#define {symbol} {name}\n{text}\n#undef {symbol}").unwrap();
+            writeln!(calls, "first={left}; dst=0x5df9; r4_dec=0xcaff; r4_upper=0xebe7; r4_inc=0x8301;\n\
+                r5_word=0x71bb; r5_upper=0x03a3; r5_inc=0x5dda; older_word=0xa55a;").unwrap();
+            let fail = i + 1;
+            if expected.is_some() {
+                writeln!(calls, "if (setjmp(stop) != 0 || {name}() != {want}) return {fail};").unwrap();
+            } else {
+                writeln!(calls, "if (setjmp(stop) == 0) {{ (void){name}(); return {fail}; }}").unwrap();
+            }
+            let r5_word = if older.is_some_and(|(addr, _)| addr == 0x4048) { 0x5678 } else { 0x71bb };
+            writeln!(calls, "if (first != {left} || dst != {dst} || r4_dec != 0xcaff || r4_upper != 0xebe7 || \
+                r4_inc != 0x8301 || r5_word != {r5_word} || r5_upper != 0x03a3 || r5_inc != 0x5dda || \
+                older_word != 0xa55a) return {};", fail + rows.len()).unwrap();
+        }
+    }
+    c.push_str(&calls);
+    c.push_str("return 0;\n}\n");
+    fs::write(&source, &c).unwrap();
+    run_emitted_c(&source, &executable, &c);
+}

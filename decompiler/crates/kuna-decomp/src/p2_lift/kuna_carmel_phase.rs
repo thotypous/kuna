@@ -1104,7 +1104,7 @@ struct DataIssue {
     incoming: Option<(OpId, OpId)>,
     outgoing: Option<(OpId, OpId)>,
     clock: Option<OpId>,
-    reads: [Option<(OpId, OpId)>; 2],
+    reads: [Option<(OpId, OpId)>; 3],
     store: Option<OpId>,
     query: Option<OpId>,
     faults: [Option<OpId>; 2],
@@ -1378,7 +1378,7 @@ impl DataIssue {
             || (at == fd.get_address() && self.incoming.is_some())
             || (tail != clock && !preceding_op(fd, clock, tail))
             || self.store.is_some_and(|store| !preceding_op(fd, store, clock)
-                || self.reads[0].is_some() || self.faults[0].is_some()) {
+                || self.reads.iter().flatten().any(|&(_, load)| !preceding_op(fd, load, store))) {
             return false;
         }
         let reads = self.reads.iter().flatten().count();
@@ -1388,7 +1388,8 @@ impl DataIssue {
             let block = fd.obank().get(fault).unwrap().get_parent().unwrap();
             let edges = fd.bblocks_ref().block(block);
             if fd.bb_op_head(block) != Some(fault) || edges.size_out() != 1 || edges.get_out(0) != block
-                || fault_follows(fd, fault, self.reads.iter().flatten().map(|&(_, load)| load)) {
+                || fault_follows(fd, fault,
+                    self.reads.iter().flatten().map(|&(_, load)| load).chain(self.store)) {
                 return false;
             }
             let seen = if self.query.is_some_and(|query| preceding_op(fd, query, fault)) {
@@ -1403,7 +1404,7 @@ impl DataIssue {
             };
             if std::mem::replace(seen, true) { return false; }
         }
-        (reads == 2) == pure_guard && self.query.is_some() == mixed_guard
+        (reads >= 2) == pure_guard && self.query.is_some() == mixed_guard
             && (self.query.is_none() || reads != 0)
             && self.reads.iter().flatten().all(|&(mark, load)| preceding_op(fd, load, clock)
                 && self.query.is_none_or(|query| preceding_op(fd, query, mark)))

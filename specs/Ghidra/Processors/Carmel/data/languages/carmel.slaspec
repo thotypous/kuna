@@ -8442,6 +8442,19 @@ macro compact_data_mixed_check(older, first, second) {
   <done>
 }
 
+macro checked_of_data_word(address, word) {
+    local older:4 = carmel_of_older_wb_word();
+    if ((older & 0x10000) == 0) goto <fetch>;
+    local write_addr:2 = older:2;
+    local bank:2 = write_addr & 0xc000;
+    if (bank == 0 || bank == 0xc000 || ((address ^ write_addr) & 0xc001) != 0) goto <fetch>;
+  <stopped>
+    carmel_data_read_conflict();
+    goto <stopped>;
+  <fetch>
+    phase_of_data_word(address, word);
+}
+
 macro compact_word_subtract_address(first, second) {
     first = R1;
     second = R2;
@@ -8673,6 +8686,24 @@ macro wide_check_word_and_pair_reads(word, low, high) {
   <sample>
 }
 
+macro wide_mixed_word_pair_reads(older, first, low, high) {
+    if ((older & 0x10000) == 0) goto <done>;
+    local addr:2 = older:2;
+    local first_diff:2 = first ^ addr;
+    local low_diff:2 = low ^ addr;
+    local high_diff:2 = high ^ addr;
+    local on_bus:1 = (first_diff < 0x8000) + (low_diff < 0x8000) + (high_diff < 0x8000);
+    if (on_bus >= 2) goto <stopped>;
+    local bank:2 = addr & 0xc000;
+    if (bank == 0 || bank == 0xc000) goto <done>;
+    if ((first_diff & 0xc001) == 0 || (low_diff & 0xc001) == 0
+        || (high_diff & 0xc001) == 0) goto <stopped>;
+    goto <done>;
+  <stopped>
+    carmel_data_read_conflict();
+    goto <stopped>;
+  <done>
+}
 :INSERT "*R1+"^wide_shift_dst_disp^":long","*R2++","FF2:FF1" is
     carmel_issue=5 & wide_left_mode=1 & wide_right_mode=1
     & wide_0_22=0x78c225 & wide_40_45=0x23 & wide_shift_dst_disp {
@@ -12218,6 +12249,225 @@ macro saved_lc1_arithmetic_shift(source, count) {
 
 @undef WIDE_SAVED_LC1_SHIFT
 
+macro saved_lc1_logic_shift(count) {
+    local incoming:2 = EST;
+    local flags:2;
+    local result:8;
+    local input:8 = zext(RN2) << 16;
+    wide_shift_ports(input, count, 32:4, 16:4, 0:1, result, flags);
+    LC1 = result(2);
+    publish_ce_feedback((incoming & 0xcfc6) | flags, incoming);
+}
+
+macro saved_lc1_logic_shift_address(address) {
+    address = R1;
+    modify_native_agu(R1, 1:2, RM0, RL0, RM0_ALIGN, 2:4, 4:2);
+}
+
+@define WIDE_SAVED_LC1_LSHIFT "$(WIDE_ORIGINAL_BITS) & wide_40_45=0x11 & wide_0_22=0x71a954"
+
+:LSHIFT "LC1","RN2","*R1++" is $(WIDE_SAVED_LC1_LSHIFT) & carmel_phase_emit=0 {
+    local address:2;
+    saved_lc1_logic_shift_address(address);
+    local count:2 = *[data]:2 address;
+    saved_lc1_logic_shift(count);
+}
+
+:LSHIFT "LC1","RN2","*R1++" is $(WIDE_SAVED_LC1_LSHIFT)
+    & carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions=0 & ce_single_tick {
+    local address:2;
+    saved_lc1_logic_shift_address(address);
+    local count:2;
+    checked_of_data_word(address, count);
+    saved_lc1_logic_shift(count);
+    build ce_single_tick;
+}
+
+@undef WIDE_SAVED_LC1_LSHIFT
+
+macro saved_lc1_add_word(word) {
+    local incoming:2 = EST;
+    local word_carry:4 = zext((incoming >> 6) & 1) << 16;
+    local left:8 = sext(A4L) * 0x10000;
+    local right:8 = sext(word) * 0x10000;
+    local flags:2;
+    local result:8;
+    wide_routed_arithmetic_flags(left, right, word_carry, 0:1, 1:1, 0:1, result, flags);
+    LC1 = result(2);
+    publish_ce_feedback((incoming & 0xcfc4) | flags, incoming);
+}
+
+macro saved_lc1_add_address(address) {
+    address = R7;
+    modify_native_agu(R7, 1:2, RM6, RL6, RM6_ALIGN, 14:4, 4:2);
+}
+
+@define WIDE_SAVED_LC1_ADDC2 "$(WIDE_ORIGINAL_BITS) & wide_40_45=0x17 & wide_0_22=0x1ba928"
+
+:ADDC2 "LC1","A4L","*R7++" is $(WIDE_SAVED_LC1_ADDC2) & carmel_phase_emit=0 {
+    local address:2;
+    saved_lc1_add_address(address);
+    local word:2 = *[data]:2 address;
+    saved_lc1_add_word(word);
+}
+
+:ADDC2 "LC1","A4L","*R7++" is $(WIDE_SAVED_LC1_ADDC2)
+    & carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions=0 & ce_single_tick {
+    local address:2;
+    saved_lc1_add_address(address);
+    local word:2;
+    checked_of_data_word(address, word);
+    saved_lc1_add_word(word);
+    build ce_single_tick;
+}
+
+@undef WIDE_SAVED_LC1_ADDC2
+
+# The DATA destination and the OF operands all sample the old AGU state.
+macro wide_xor_r4_word_addresses(disp, dest, first) {
+    dest = R4;
+    first = R3 + disp;
+    modify_native_agu(R4, 0xffff:2, RM4, RL4, RM4_ALIGN, 8:4, 4:2);
+    compact_pair_read_check(first, dest);
+}
+
+macro wide_xor_pair_snapshot(disp, pair, dest, first, low, high) {
+    dest = R4;
+    first = R3 + disp;
+    low = pair;
+    high = low + 1;
+}
+
+macro wide_xor_r4_pair_addresses(disp, dest, first, low, high) {
+    wide_xor_pair_snapshot(disp, R4, dest, first, low, high);
+    modify_native_agu(R4, 2:2, RM4, RL4, RM4_ALIGN, 8:4, 4:2);
+    wide_check_word_and_pair_reads(first, low, high);
+}
+
+macro wide_xor_r5_pair_addresses(disp, dest, first, low, high) {
+    wide_xor_pair_snapshot(disp, R5, dest, first, low, high);
+    modify_native_agu(R4, 0xffff:2, RM4, RL4, RM4_ALIGN, 8:4, 4:2);
+    modify_native_agu(R5, 2:2, RM4, RL4, RM4_ALIGN, 10:4, 4:2);
+    wide_check_word_and_pair_reads(first, low, high);
+}
+
+macro wide_xor_word_result(first, low, high, word) {
+    local xor_word:2 = first ^ low;
+    local high_lane:8 = zext(high);
+    local result:8 = (high_lane << 16) | zext(xor_word);
+    local flags:2;
+    shift_flags(result, 0:1, flags);
+    local status:2 = (EST & 0xcfc7) | flags;
+    compact_pair_fft(result, result, 0:1, status);
+    publish_alu_ce(status);
+    word = result:2;
+}
+
+macro wide_xor_pair_wb(dest, first, low, high) {
+    local older:4 = carmel_of_older_wb_word();
+    wide_mixed_word_pair_reads(older, first, low, high);
+    local left:2;
+    local right_low:2;
+    local right_high:2;
+    local word:2;
+    phase_of_data_word(first, left);
+    phase_of_data_word(low, right_low);
+    phase_of_data_word(high, right_high);
+    wide_xor_word_result(left, right_low, right_high, word);
+    phase_wb_data_word(dest, word);
+}
+
+macro wide_xor_pair_unstaged(dest, first, low, high) {
+    local left:2 = *[data]:2 first;
+    local right_low:2 = *[data]:2 low;
+    local right_high:2 = *[data]:2 high;
+    local word:2;
+    wide_xor_word_result(left, right_low, right_high, word);
+    *[data]:2 dest = word;
+}
+
+@define WIDE_XOR_DATA "$(WIDE_ORIGINAL_BITS) & logic_ce_bank=0 & wide_20_22=6 & wide_logic_rmw_op=2 & wide_alias_logic_lhs=0x23 & wide_shift_dst_disp"
+@define WIDE_XOR_R4_WORD "$(WIDE_XOR_DATA) & wide_alias_logic_dst=0x1c & wide_40_45=4 & wide_0_1=0"
+@define WIDE_XOR_R4_PAIR "$(WIDE_XOR_DATA) & wide_alias_logic_dst=4 & wide_40_45=0x14 & wide_0_1=1"
+@define WIDE_XOR_R5_PAIR "$(WIDE_XOR_DATA) & wide_alias_logic_dst=0x1c & wide_40_45=0x15 & wide_0_1=1"
+@define WIDE_XOR_DATA_PHASE "carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions=0 & ce_single_tick"
+
+:XOR "*R4--","*(R3+"^wide_shift_dst_disp^")","*R4" is $(WIDE_XOR_R4_WORD) & carmel_phase_emit=0 {
+    local dest:2;
+    local first:2;
+    local disp:2 = sext(wide_shift_dst_disp:1);
+    wide_xor_r4_word_addresses(disp, dest, first);
+    local left:2 = *[data]:2 first;
+    local right:2 = *[data]:2 dest;
+    local word:2;
+    wide_xor_word_result(left, right, 0:2, word);
+    *[data]:2 dest = word;
+}
+
+:XOR "*R4--","*(R3+"^wide_shift_dst_disp^")","*R4" is $(WIDE_XOR_R4_WORD) & $(WIDE_XOR_DATA_PHASE) {
+    local dest:2;
+    local first:2;
+    local disp:2 = sext(wide_shift_dst_disp:1);
+    wide_xor_r4_word_addresses(disp, dest, first);
+    local older:4 = carmel_of_older_wb_word();
+    compact_data_mixed_check(older, first, dest);
+    local left:2;
+    local right:2;
+    local word:2;
+    phase_of_data_word(first, left);
+    phase_of_data_word(dest, right);
+    wide_xor_word_result(left, right, 0:2, word);
+    phase_wb_data_word(dest, word);
+    build ce_single_tick;
+}
+
+:XOR "*R4","*(R3+"^wide_shift_dst_disp^")","long *R4++" is $(WIDE_XOR_R4_PAIR) & carmel_phase_emit=0 {
+    local dest:2;
+    local first:2;
+    local low:2;
+    local high:2;
+    local disp:2 = sext(wide_shift_dst_disp:1);
+    wide_xor_r4_pair_addresses(disp, dest, first, low, high);
+    wide_xor_pair_unstaged(dest, first, low, high);
+}
+
+:XOR "*R4","*(R3+"^wide_shift_dst_disp^")","long *R4++" is $(WIDE_XOR_R4_PAIR) & $(WIDE_XOR_DATA_PHASE) {
+    local dest:2;
+    local first:2;
+    local low:2;
+    local high:2;
+    local disp:2 = sext(wide_shift_dst_disp:1);
+    wide_xor_r4_pair_addresses(disp, dest, first, low, high);
+    wide_xor_pair_wb(dest, first, low, high);
+    build ce_single_tick;
+}
+
+:XOR "*R4--","*(R3+"^wide_shift_dst_disp^")","long *R5++" is $(WIDE_XOR_R5_PAIR) & carmel_phase_emit=0 {
+    local dest:2;
+    local first:2;
+    local low:2;
+    local high:2;
+    local disp:2 = sext(wide_shift_dst_disp:1);
+    wide_xor_r5_pair_addresses(disp, dest, first, low, high);
+    wide_xor_pair_unstaged(dest, first, low, high);
+}
+
+:XOR "*R4--","*(R3+"^wide_shift_dst_disp^")","long *R5++" is $(WIDE_XOR_R5_PAIR) & $(WIDE_XOR_DATA_PHASE) {
+    local dest:2;
+    local first:2;
+    local low:2;
+    local high:2;
+    local disp:2 = sext(wide_shift_dst_disp:1);
+    wide_xor_r5_pair_addresses(disp, dest, first, low, high);
+    wide_xor_pair_wb(dest, first, low, high);
+    build ce_single_tick;
+}
+
+@undef WIDE_XOR_DATA_PHASE
+@undef WIDE_XOR_R5_PAIR
+@undef WIDE_XOR_R4_PAIR
+@undef WIDE_XOR_R4_WORD
+@undef WIDE_XOR_DATA
 :EXTRACTZ "long *R2","GB3",bitfield_descriptor is $(WIDE_ORIGINAL_BITS)
     & wide_40_45=0xf & wide_0_22=0x768507 & bitfield_descriptor & ce_tick {
     local destination:2 = R2;
