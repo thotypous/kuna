@@ -43,7 +43,7 @@ pub(super) struct Overlap {
     pub claimed_wb: BTreeSet<OpId>,
 }
 
-type IssueEdges<'a> = BTreeMap<u64, Option<&'a Address>>;
+pub(super) type IssueEdges<'a> = BTreeMap<u64, Option<&'a Address>>;
 
 fn add_edge<'a>(edges: &mut IssueEdges<'a>, from: &Address, to: Option<&'a Address>) {
     if to == Some(from) {
@@ -57,7 +57,7 @@ fn add_edge<'a>(edges: &mut IssueEdges<'a>, from: &Address, to: Option<&'a Addre
 }
 
 /// Visit logical issue edges, ignoring the internal branches of one p-code expansion.
-fn issue_edges(fd: &Funcdata) -> (IssueEdges<'_>, IssueEdges<'_>) {
+pub(super) fn issue_edges(fd: &Funcdata) -> (IssueEdges<'_>, IssueEdges<'_>) {
     let address = |id| fd.obank().get(id).unwrap().get_addr();
     let mut incoming = BTreeMap::new();
     let mut outgoing = BTreeMap::new();

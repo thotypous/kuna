@@ -10643,3 +10643,66 @@ fn carmel_data_of_sees_old_word_until_wb_drains() {
     fs::write(&source, &c).unwrap();
     run_emitted_c(&source, &scratch.path().join("data-wb"), &c);
 }
+
+#[test]
+fn carmel_qualified_msu_samples_old_address_and_publishes_only_enabled_result() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    const ISSUE: [u8; 6] = [0x53, 0x3f, 0, 0xad, 0xa3, 0x1a];
+    const NOP: [u8; 6] = [0x2b, 0xec, 0, 0x2b, 0xec, 0];
+    const RETURN: [u8; 6] = [0x2b, 0xd8, 0, 0x2b, 0xec, 0];
+    let temp = tempfile::tempdir().unwrap();
+    let [binary, specs, source, exe] = ["msu.bin", "specs", "msu.c", "msu.exe"]
+        .map(|name| temp.path().join(name));
+    tracked_carmel_entry_specs(&specs, &[
+        ("R3", 0xc040), ("R5", 0x4048), ("RN5", 2), ("X1", 0xba98),
+        ("ECFG", 0), ("EST", 0), ("CECFG1", 0x1000), ("CECFG2", 0x1000),
+        ("PACFG", 0), ("RM2", 0), ("RM4", 0), ("RL2", 0), ("RL4", 0), ("MAC1_FLAGS_0", 0),
+    ], 0, 0);
+    let spec = specs.join("Ghidra/Processors/Carmel/data/languages/carmel.pspec");
+    let original = fs::read_to_string(&spec).unwrap();
+    let mut issues = [NOP; 12];
+    issues[0] = ISSUE;
+    issues[10] = RETURN;
+    fs::write(&binary, issues.as_flattened()).unwrap();
+    let decompile = |reg: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuna"));
+        cmd.env("KUNA_SPECS", &specs).arg("decompile").arg(&binary).args([
+            "0", "--addr", "--raw-image", "--base", "0", "--target", "Carmel:BE:24:default:default",
+            "--assert-strict", "--assert", &format!("return %{reg} unsigned short"),
+            "--assert", "param 0 %CE_ADMISSION_BEFORE_0 unsigned char admission",
+            "--assert", "param 1 %CETBL unsigned short table",
+            "--assert", "data [data,0x4048] volatile unsigned short left_word",
+            "--assert", "data [data,0xc040] volatile unsigned short right_word",
+        ]);
+        cmd.output().unwrap()
+    };
+    let cold_required = decompile("R3");
+    let error = String::from_utf8_lossy(&cold_required.stderr);
+    assert!(!cold_required.status.success() && error.contains("older result window"), "{error}");
+    let context = "<context_set space=\"code\" first=\"0\" last=\"0\">\
+        <set name=\"carmel_entry_pipeline_empty\" val=\"1\"/></context_set>";
+    fs::write(&spec, original.replace("</context_data>", &format!("{context}</context_data>"))).unwrap();
+    let mut c = String::from("#include <stdint.h>\n#include <stdbool.h>\n\
+        volatile unsigned short left_word = 0x4000, right_word = 0x8000;\n");
+    for (name, register) in [("result", "R3"), ("pointer", "R5"), ("latch", "X1")] {
+        let out = decompile(register);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let emitted = String::from_utf8(out.stdout).unwrap();
+        writeln!(c, "#define sub_0 {name}\n{emitted}\n#undef sub_0").unwrap();
+    }
+    c.push_str("int main(void) {\n\
+        if (result(0, 0xffff) != 0xc040 || pointer(0, 0xffff) != 0x4048 || latch(0, 0xffff) != 0xba98) return 1;\n\
+        if (result(2, 0) != 0xc041 || pointer(2, 0) != 0x404a || latch(2, 0) != 0x4000) return 2;\n\
+        if (result(2, 0xffff) != 0xa040 || pointer(2, 0xffff) != 0x404a || latch(2, 0xffff) != 0x4000) return 3;\n\
+        if (left_word != 0x4000 || right_word != 0x8000) return 4;\n\
+        return 0;\n}\n");
+    fs::write(&source, &c).unwrap();
+    run_emitted_c(&source, &exe, &c);
+    issues[3] = [0x21, 0xac, 0x20, 0x2b, 0xec, 0];
+    fs::write(&binary, issues.as_flattened()).unwrap();
+    let busy = decompile("R3");
+    let error = String::from_utf8_lossy(&busy.stderr);
+    assert!(!busy.status.success() && error.contains("younger result window"), "{error}");
+}

@@ -4199,6 +4199,20 @@ connected operand fetch can update `X1` even when the result is disabled.
 An operand-token peer redirects the words into prepared inputs instead;
 multiply uses the retained cells of that physical slot.
 
+Qualified MAC1 subtraction can advance its DATA pointers and latch `X1`
+without publishing the late result. The postmodified pointer and the old
+word used by the multiplier are separate values. Long DATA writeback
+uses the original address pair; the register-result route can overwrite
+its own postmodified pointer only after result enable. An enabled result
+targeting `EST` instead raises register-write contention before CE
+feedback publishes.
+
+These late routes require a proved straight-line window of idle issues
+around the result. A processor specification can set
+`carmel_entry_pipeline_empty=1` at an entry known to have no pending
+physical issues. It does not initialize the retained cells or CE samples,
+and does not waive any checks at successor issues.
+
 Signed extraction with an inactive result port can still update flags using
 its retained ALU bitmap. The operand and status cells are separate from the
 architectural destination; a disconnected result does not imply no state

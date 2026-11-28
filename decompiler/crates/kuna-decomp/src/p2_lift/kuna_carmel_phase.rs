@@ -11,7 +11,7 @@ use crate::{
     op::PcodeOp, typeop::type_op_for,
 };
 
-use super::kuna_carmel_reset::{AddressAdmission, Execute, IssueEffects, Overlap, lower_control};
+use super::kuna_carmel_reset::{AddressAdmission, Execute, IssueEffects, Overlap, issue_edges, lower_control};
 
 const CLOCKS: usize = 5;
 const MATURE_ENTRY: u8 = 1 << CLOCKS;
@@ -77,6 +77,7 @@ pub(crate) struct PhaseDecode<'a> {
     repeat_d2_write: Option<u64>,
     repeat_of: Option<u64>,
     issue_slot: Option<u64>,
+    isolated_result: Option<u64>,
     ff: Option<FfOps>,
     data: Option<DataOps>,
     cells: Option<CellOps>,
@@ -111,6 +112,7 @@ impl<'a> PhaseDecode<'a> {
         let repeat_d2_write = index(b"carmel_repeat_d2_write");
         let repeat_of = index(b"carmel_repeat_register_at_of");
         let issue_slot = index(b"carmel_sample_issue_slot");
+        let isolated_result = index(b"carmel_require_isolated_result");
         let ff = (|| Some(FfOps {
             capture: index(b"carmel_capture_ff_before_ex")?,
             fetch: index(b"carmel_sample_ff_at_of")?,
@@ -139,7 +141,7 @@ impl<'a> PhaseDecode<'a> {
         Some(Self { arch, translate, word, saved, tick, admission, entry_admission, redirect, delay_tick, delay_mask,
             fixed_read_tick, fixed_load, fixed_store, end_unmodeled, omitted, idle_tick, reset, register_ex, data_ex, address_ex,
             operand_fetch, reset_ex_end,
-            staged_data, repeat_r3, repeat_d2_write, repeat_of, issue_slot, ff, data, cells })
+            staged_data, repeat_r3, repeat_d2_write, repeat_of, issue_slot, isolated_result, ff, data, cells })
     }
 
     pub(crate) fn lower(&self, fd: &mut Funcdata, visits: &VisitedMap) -> KunaResult<()> {
@@ -159,6 +161,7 @@ impl<'a> PhaseDecode<'a> {
         let mut repeat_samples = Vec::new();
         let mut repeat_writes = Vec::new();
         let mut repeat_operand_fetches = Vec::new();
+        let mut isolated_results = Vec::new();
         for (_, op_id) in fd.obank().iter_all() {
             let op = fd.obank().get(op_id).unwrap();
             if op.get_parent().is_none() { continue; }
@@ -214,6 +217,8 @@ impl<'a> PhaseDecode<'a> {
                 repeat_operand_fetches.push(op_id);
             } else if self.data.is_some_and(|data| data.older == Some(index)) {
                 scheduled_data = true;
+            } else if Some(index) == self.isolated_result {
+                isolated_results.push(op_id);
             } else if Some(index) == self.issue_slot {
                 slot_fetches = true;
             } else if self.data.is_some_and(|data| index == data.reserve || index == data.commit) {
@@ -228,6 +233,12 @@ impl<'a> PhaseDecode<'a> {
             }
         }
         reads |= entry_reads;
+        if !isolated_results.is_empty() {
+            let empty_entry = self.arch.with_context_db(|db| {
+                matches!(db.get_variable_value(b"carmel_entry_pipeline_empty", fd.get_address()), Ok(1))
+            });
+            prove_isolated_results(fd, visits, &isolated_results, &markers, empty_entry)?;
+        }
         if !repeat_samples.is_empty() {
             prove_repeat_samples(fd, visits, &repeat_samples, self.repeat_d2_write)?;
         }
@@ -647,6 +658,48 @@ fn sample_error(fd: &Funcdata, op: OpId, sample: &str) -> KunaError {
     KunaError::lowlevel(format!("Unproved Carmel {sample} at CODE {:#x}", addr.get_offset() / 3))
 }
 
+/// Serial p-code preserves the result only if no issued neighbor can sample or
+/// contend with it before publication. Internal p-code branches are not issues.
+fn prove_isolated_results(
+    fd: &mut Funcdata, visits: &VisitedMap, windows: &[OpId],
+    markers: &[(OpId, u64, Mark)], empty_entry: bool,
+) -> KunaResult<()> {
+    let (incoming, outgoing) = issue_edges(fd);
+    let idle: BTreeSet<_> = markers.iter().filter_map(|&(_, offset, mark)|
+        (mark == Mark::Idle).then_some(offset)).collect();
+    let previous = |at: &Address| {
+        let prior = incoming.get(&at.get_offset()).copied().flatten()?;
+        (outgoing.get(&prior.get_offset()) == Some(&Some(at))
+            && contiguous(visits, prior, at) && idle.contains(&prior.get_offset())).then_some(prior)
+    };
+    let following = |at: &Address| {
+        let next = outgoing.get(&at.get_offset()).copied().flatten()?;
+        (incoming.get(&next.get_offset()) == Some(&Some(at))
+            && contiguous(visits, at, next) && idle.contains(&next.get_offset())).then_some(next)
+    };
+    for &marker in windows {
+        let op = fd.obank().get(marker).unwrap();
+        let bound = fd.vbank().get(op.get_in(1).unwrap()).unwrap();
+        if !bound.is_constant() || !matches!(bound.get_offset(), 3 | 5) {
+            return Err(sample_error(fd, marker, "isolated result bound"));
+        }
+        let root = op.get_addr();
+        let mut at = root;
+        // Four older physical issues cover address generation through writeback.
+        for _ in 0..4 {
+            if empty_entry && at == fd.get_address() && !incoming.contains_key(&at.get_offset()) {
+                break;
+            }
+            at = previous(at).ok_or_else(|| sample_error(fd, marker, "older result window"))?;
+        }
+        at = root;
+        for _ in 0..bound.get_offset() {
+            at = following(at).ok_or_else(|| sample_error(fd, marker, "younger result window"))?;
+        }
+    }
+    for &marker in windows { fd.op_destroy(marker); }
+    Ok(())
+}
 // The count sees the first successor's address phase, not its entire issue.
 // Only writes explicitly classified as D2 may reach the OF sample.
 fn prove_repeat_samples(
