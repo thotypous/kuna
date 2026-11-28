@@ -6984,7 +6984,13 @@ impl PrintC {
             if tok.print1 == "<<" {
                 if let Some(plan) = crate::p9_emit::kuna_armconstantshift::plan_arm_constant_lsl(fd, arch, op)
                     .or_else(|| self.fixed64_shift_plan(fd, arch, op)) {
-                    self.emit_constant_lsl(fd, arch, op, plan);
+                    self.emit_fixed_shift(fd, arch, tok, op, plan);
+                    return;
+                }
+            }
+            if !self.options.nocasts && matches!(tok.print1, "<<" | ">>") {
+                if let Some(plan) = super::kuna_constantshift::plan_wide_literal(fd, arch, op) {
+                    self.emit_fixed_shift(fd, arch, tok, op, plan);
                     return;
                 }
             }
@@ -7175,18 +7181,19 @@ impl PrintC {
         crate::p9_emit::kuna_narrowmultiply::plan(fd, arch, op, |vn| self.printed_operand_type(fd, vn, op))
     }
 
-    /// Emit each fixed-shift operand once, converting the shiftee before LSL.
-    fn emit_constant_lsl(
+    /// Convert the shiftee before the shift, then restore signed result use.
+    fn emit_fixed_shift(
         &mut self,
         fd: &Funcdata,
         arch: &Architecture,
+        token: &'static OpToken,
         op: OpId,
         plan: crate::p9_emit::kuna_constantshift::ConstantLslPlan,
     ) {
         if let Some(result_type) = &plan.signed_result_type {
             self.push_cast_open(result_type, op);
         }
-        self.push_op(&tokens::SHIFT_LEFT, Some(op_key(op)));
+        self.push_op(token, Some(op_key(op)));
         self.push_cast_open(&plan.unsigned_type, op);
         self.push_vn_ir(fd, arch, plan.lhs, op);
         self.push_cast_close(&plan.unsigned_type);

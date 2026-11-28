@@ -1926,6 +1926,13 @@ default spelling and the converted one on x86-64, AArch64, PowerPC64 and MIPS64
 objects from `tests/fixtures/wide-integer-emission/`; `kuna-cli/tests/wide_shift_emission.rs`
 executes the emitted C at O0/O2 under UBSan over signed boundary bit patterns.
 
+**(kuna) Variable shifts of small 64-bit constants in C.** Constant folding
+can turn the shiftee of a 64-bit logical shift into an integer literal that C
+would evaluate at 32 bits. `p9_emit/kuna_constantshift.rs (plan_wide_literal)`
+converts the literal before either direction of variable shift and restores
+the declared result's signedness if needed. Widening only the result cannot
+repair the shift at counts from 32 to 63.
+
 **(kuna) Wrapping widened additions — `option wrapadd`.** A four-byte addition
 whose result a wider sign extension observes, such as MIPS `addiu` or RISC-V
 `addw` feeding a 64-bit register, wraps at 32 bits on the machine. Printed as

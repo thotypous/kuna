@@ -75,5 +75,31 @@ pub(crate) fn plan_fixed64_lsl(
     })
 }
 
+/// A folded constant is printed as a C literal, not as its 64-bit IR type.
+pub(super) fn plan_wide_literal(
+    fd: &Funcdata, arch: &Architecture, op: OpId,
+) -> Option<ConstantLslPlan> {
+    let operation = fd.obank().get(op)?;
+    if !matches!(operation.code(), OpCode::CPUI_INT_LEFT | OpCode::CPUI_INT_RIGHT) {
+        return None;
+    }
+    let (lhs, count) = (operation.get_in(0)?, operation.get_in(1)?);
+    let value = fd.vbank().get(lhs)?;
+    let output = fd.vbank().get(operation.get_out()?)?;
+    if !value.is_constant() || value.get_size() != 8 || output.get_size() != 8
+        || value.get_offset() > u64::from(u32::MAX) || fd.vbank().get(count)?.is_constant() {
+        return None;
+    }
+    let signed_result_type = match output.get_type_def_facing().get_metatype() {
+        type_metatype::TYPE_INT | type_metatype::TYPE_ENUM_INT =>
+            Some(arch.types().get_base(8, type_metatype::TYPE_INT).ok()?),
+        _ => None,
+    };
+    Some(ConstantLslPlan {
+        lhs, count, signed_result_type,
+        unsigned_type: arch.types().get_base(8, type_metatype::TYPE_UINT).ok()?,
+    })
+}
+
 #[cfg(test)]
 mod tests;

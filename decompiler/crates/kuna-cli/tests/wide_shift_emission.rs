@@ -126,3 +126,51 @@ fn fixed_wide_shifts_keep_their_spelling_by_default() {
         assert!(!code.contains("unsigned long"), "{file}: {code}");
     }
 }
+
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn wide_literal_shifts_execute_before_result_conversion() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let (image, source, executable) =
+        (scratch.path().join("shift.xml"), scratch.path().join("shift.c"), scratch.path().join("shift"));
+    // Move 0x30000 into EAX, shift all of RAX by the incoming count, return.
+    std::fs::write(&image, r#"<binaryimage arch="x86:LE:64:default:gcc">
+      <bytechunk space="ram" offset="0x1000" readonly="true">89f9b80000030048d3e0c3</bytechunk>
+      <bytechunk space="ram" offset="0x1100" readonly="true">89f9b80000030048d3e8c3</bytechunk>
+      <symbol space="ram" offset="0x1000" name="literal_left"/>
+      <symbol space="ram" offset="0x1100" name="literal_right"/>
+    </binaryimage>"#).unwrap();
+    let mut code = String::from("#include <stdint.h>\n");
+    for name in ["literal_left", "literal_right"] {
+        let output = common::process::required_output(
+            Command::new(env!("CARGO_BIN_EXE_kuna")).arg("decompile").arg(&image).arg(name)
+                .args(["--assert-strict", "--assert",
+                       &format!("prototype {name} unsigned long long {name}(unsigned int count)")]),
+        );
+        code.push_str(&String::from_utf8(output.stdout).unwrap());
+        code.push('\n');
+    }
+    code.push_str("int main(void) {\n\
+        for (unsigned i = 0; i < 64; ++i) {\n\
+            if (literal_left(i) != (UINT64_C(0x30000) << i)) return 1;\n\
+            if (literal_right(i) != (UINT64_C(0x30000) >> i)) return 2;\n\
+        }\n\
+        return 0;\n\
+    }\n");
+    std::fs::write(&source, &code).unwrap();
+    for opt in ["-O0", "-O2"] {
+        common::process::required_output(
+            Command::new("cc").args([opt, "-std=c11", "-fsanitize=undefined", "-fno-sanitize-recover=undefined"])
+                .arg(&source).arg("-o").arg(&executable),
+        );
+        let run = common::process::output_with_timeout(
+            &mut Command::new(&executable),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(10),
+        ).unwrap();
+        assert!(run.status.success(), "{code}\n{}", String::from_utf8_lossy(&run.stderr));
+    }
+}
