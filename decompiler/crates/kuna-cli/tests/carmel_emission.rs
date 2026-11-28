@@ -10706,3 +10706,52 @@ fn carmel_qualified_msu_samples_old_address_and_publishes_only_enabled_result() 
     let error = String::from_utf8_lossy(&busy.stderr);
     assert!(!busy.status.success() && error.contains("younger result window"), "{error}");
 }
+
+#[test]
+fn carmel_wide_ashift_samples_both_words_before_postmodify_and_writes_saved_lc1() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    const NOP: [u8; 6] = [0x2b, 0xec, 0, 0x2b, 0xec, 0];
+    const RET: [u8; 6] = [0x2b, 0xd8, 0, 0x2b, 0xec, 0];
+    const STORE: [u8; 6] = [0x80, 0x56, 0x78, 0xc6, 0x40, 0];
+    const SHIFT: [u8; 6] = [0x8a, 0x80, 0x79, 0xf3, 0xa8, 0x02];
+    let temp = tempfile::tempdir().unwrap();
+    let [binary, specs, source, exe] = ["shift.bin", "specs", "shift.c", "shift.exe"]
+        .map(|name| temp.path().join(name));
+    tracked_carmel_entry_specs(&specs, &[
+        ("R0", 0xc040), ("R1", 0xc040), ("R2", 0x0040), ("RN2", 3), ("PACFG", 0),
+        ("RM2", 0), ("RL2", 0), ("LC", 0x6263), ("EST", 0),
+        ("ECFG", 0), ("CECFG1", 0x1000), ("CECFG2", 0x1000), ("CETBL", 0xffff),
+    ], 0, 0);
+    let mut c = String::from("#include <stdbool.h>\n#include <stdint.h>\n\
+        volatile unsigned short value, count;\n");
+    let mut calls = String::from("int main(void) {\n");
+    for (distance, result) in [(2, 0xffff), (3, 0)] {
+        let mut image = vec![NOP; 3];
+        image.push(STORE);
+        image.extend(std::iter::repeat_n(NOP, distance - 1));
+        image.push(SHIFT);
+        image.extend([NOP; 6]);
+        image.push(RET);
+        fs::write(&binary, image.as_flattened()).unwrap();
+        for (reg, want) in [("LC1", result), ("LC", 0x6263_u16), ("R2", 0x0043)] {
+            let name = format!("shift_{distance}_{}", reg.to_ascii_lowercase());
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuna"));
+            cmd.env("KUNA_SPECS", &specs).arg("decompile").arg(&binary).args([
+                "0", "--addr", "--raw-image", "--base", "0", "--target", "Carmel:BE:24:default:default",
+                "--assert-strict", "--assert", &format!("return %{reg} unsigned short"),
+                "--assert", "data [data,0xc040] volatile unsigned short value",
+                "--assert", "data [data,0x0040] volatile unsigned short count",
+            ]);
+            let out = common::process::required_output(&mut cmd);
+            let emitted = String::from_utf8(out.stdout).unwrap();
+            writeln!(c, "#define sub_0 {name}\n{emitted}\n#undef sub_0").unwrap();
+            writeln!(calls, "value=0xc460; count=0x7c4b; if ({name}() != {want:#x} || value != 0x5678 || count != 0x7c4b) return {distance};").unwrap();
+        }
+    }
+    c.push_str(&calls);
+    c.push_str("return 0;\n}\n");
+    fs::write(&source, &c).unwrap();
+    run_emitted_c(&source, &exe, &c);
+}

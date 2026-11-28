@@ -4192,6 +4192,11 @@ At a distance of three, the read observes the published word. The ordering
 preserves consecutive stores and suppresses an unpublished write if the
 competing operand fetch stops.
 
+The wide DATA-input arithmetic shift reads the signed source word and signed
+shift count from separate captured addresses. The count pointer advances
+before arbitration; the shift still uses the word at its old address.
+The high result word is written to the saved loop count `LC1`, not `LC`.
+
 Qualified rounded multiply separates address admission from result enable.
 The first five issues use explicit incoming admission samples; after five
 proved clocks the sample comes from the preceding issue history. An admitted

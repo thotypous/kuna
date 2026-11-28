@@ -12171,6 +12171,53 @@ macro wide_extract_zero(source, width, offset, result) {
     build ce_tick;
 }
 
+macro saved_lc1_shift_addresses(source, count) {
+    source = R1;
+    count = R2;
+    modify_native_agu(R2, RN2, RM2, RL2, RM2_ALIGN, 4:4, 1:2);
+    compact_pair_read_check(source, count);
+}
+
+macro saved_lc1_arithmetic_shift(source, count) {
+    local incoming:2 = EST;
+    local input:8 = sext(source) * 0x10000;
+    local result:8;
+    local flags:2;
+    wide_shift_ports(input, count, 32:4, 16:4, 1:1, result, flags);
+    local word:2;
+    wide_shift_word_limit(result, flags, word);
+    LC1 = word;
+    publish_ce_feedback((incoming & 0xcfc6) | flags, incoming);
+}
+
+@define WIDE_SAVED_LC1_SHIFT "$(WIDE_ORIGINAL_BITS) & wide_40_45=0xa & wide_0_22=0x73a802"
+
+:ASHIFT "LC1","*R1","*R2+=RN2" is $(WIDE_SAVED_LC1_SHIFT) & carmel_phase_emit=0 {
+    local first:2;
+    local second:2;
+    saved_lc1_shift_addresses(first, second);
+    local source:2 = *[data]:2 first;
+    local count:2 = *[data]:2 second;
+    saved_lc1_arithmetic_shift(source, count);
+}
+
+:ASHIFT "LC1","*R1","*R2+=RN2" is $(WIDE_SAVED_LC1_SHIFT)
+    & carmel_phase_emit=1 & carmel_single_issue=0 & hw_loop_actions=0 & ce_single_tick {
+    local first:2;
+    local second:2;
+    saved_lc1_shift_addresses(first, second);
+    local older:4 = carmel_of_older_wb_word();
+    compact_data_mixed_check(older, first, second);
+    local source:2;
+    local count:2;
+    phase_of_data_word(first, source);
+    phase_of_data_word(second, count);
+    saved_lc1_arithmetic_shift(source, count);
+    build ce_single_tick;
+}
+
+@undef WIDE_SAVED_LC1_SHIFT
+
 :EXTRACTZ "long *R2","GB3",bitfield_descriptor is $(WIDE_ORIGINAL_BITS)
     & wide_40_45=0xf & wide_0_22=0x768507 & bitfield_descriptor & ce_tick {
     local destination:2 = R2;
