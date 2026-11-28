@@ -10335,6 +10335,69 @@ fn carmel_cliw_no_provider_keeps_the_core_ports() {
     fs::write(&source, &c).unwrap();
     run_emitted_c(&source, &executable, &c);
 }
+#[test]
+fn carmel_cliw_entry_read_requires_empty_older_writeback() {
+    if common::process::optional_output(Command::new("cc").arg("--version")).is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("chain.xml");
+    let specs = dir.path().join("specs");
+    let source = dir.path().join("chain.c");
+    let executable = dir.path().join("chain.exe");
+    let arch = "Carmel:BE:24:default:default";
+    let pspec = specs.join("Ghidra/Processors/Carmel/data/languages/carmel.pspec");
+    tracked_carmel_entry_specs(&specs, &[
+        ("SP", 0x4000), ("R2", 0x7fff), ("VA4_CELL_0", 0x0021), ("EST", 0),
+        ("CECFG1", 0), ("CECFG2", 0), ("CETBL", 0), ("ECFG", 0),
+    ], 0, 0);
+    fs::write(&image, format!(
+        "<binaryimage arch=\"{arch}\">\n\
+         <bytechunk space=\"code\" offset=\"0\" readonly=\"true\">0f3017dfa9c2{}2bd8002bec00</bytechunk>\n\
+         <bytechunk space=\"cliw\" offset=\"0x114\" readonly=\"true\">7fffff2601003fffff934088</bytechunk>\n\
+         <symbol space=\"code\" offset=\"0\" name=\"long_source\"/>\n</binaryimage>\n",
+        "2bec002bec00".repeat(8),
+    )).unwrap();
+    let original = fs::read_to_string(&pspec).unwrap();
+    for site in [None, Some(6), Some(0)] {
+        if let Some(site) = site {
+            let setting = format!(
+                "<context_set space=\"code\" first=\"{site}\" last=\"{site}\">\
+                 <set name=\"carmel_entry_wb_empty\" val=\"1\"/></context_set>"
+            );
+            fs::write(&pspec, original.replace("</context_data>", &(setting + "</context_data>"))).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_kuna"))
+            .env("KUNA_SPECS", &specs).arg("decompile").arg(&image).args([
+                "long_source", "--target", arch, "--assert-strict",
+                "--assert", "data [data,0x8003] volatile unsigned short side_word",
+                "--assert", "data [data,0x8000] volatile unsigned short low_word",
+                "--assert", "data [data,0x21] volatile unsigned short high_word",
+                "--assert", "return %A1H unsigned short",
+            ]).output().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        if site != Some(0) {
+            assert!(!output.status.success() && error.contains("DATA operand fetch with older writeback"), "{error}");
+            continue;
+        }
+        assert!(output.status.success(), "{error}");
+        let emitted = String::from_utf8(output.stdout).unwrap();
+        assert!(!emitted.contains("halt_"), "{emitted}");
+        let c = format!("#include <stdbool.h>\n#include <stdint.h>\n#include <stdlib.h>\n\
+            #define CONCAT22(h,l) (((uint32_t)(uint16_t)(h) << 16) | (uint16_t)(l))\n\
+            #define CONCAT14(h,l) (((uint64_t)(uint8_t)(h) << 32) | (uint32_t)(l))\n\
+            static _Noreturn void carmel_data_read_conflict(void) {{ abort(); }}\n\
+            volatile unsigned short side_word = 0x1357, low_word = 0x4567, high_word = 0x8123;\n\
+            {emitted}\nint main(void) {{\n\
+            if (long_source() != 0x8123) return 1;\n\
+            high_word = 0x2468;\n\
+            if (long_source() != 0x2468) return 2;\n\
+            return 0;\n}}\n");
+        fs::write(&source, &c).unwrap();
+        run_emitted_c(&source, &executable, &c);
+    }
+}
+
 fn run_emitted_c(source: &Path, executable: &Path, emitted: &str) {
     for opt in ["-O0", "-O2"] {
         common::process::required_output(Command::new("cc")

@@ -46,6 +46,7 @@ struct CellOps {
 }
 
 pub(crate) struct PhaseDecode<'a> {
+    arch: &'a Architecture,
     translate: &'a dyn EngineTranslate,
     word: usize,
     saved: (u32, u32),
@@ -129,7 +130,7 @@ impl<'a> PhaseDecode<'a> {
         let translate = arch.translate();
         let saved = translate.set_context_read_override(word, 0, 0);
         translate.set_context_read_override(word, saved.0 | bits, saved.1 | bits);
-        Some(Self { translate, word, saved, tick, admission, entry_admission, redirect, delay_tick, delay_mask,
+        Some(Self { arch, translate, word, saved, tick, admission, entry_admission, redirect, delay_tick, delay_mask,
             fixed_read_tick, fixed_load, fixed_store, end_unmodeled, omitted, idle_tick, reset, register_ex, data_ex, address_ex,
             operand_fetch, reset_ex_end,
             staged_data, repeat_r3, repeat_d2_write, repeat_of, issue_slot, ff, data, cells })
@@ -324,7 +325,10 @@ impl<'a> PhaseDecode<'a> {
             let ports = ff_regs.as_ref().map_or(&[][..], |ports| &ports[..]);
             self.trace(fd, visits, &known, &delayed, &dual_reads, ports, scheduled_data, block)
         }).collect();
-        let inputs = incoming_proofs(fd, visits, &blocks, &traces, issue_cells);
+        let entry_wb_empty = scheduled_data && self.arch.with_context_db(|db| {
+            matches!(db.get_variable_value(b"carmel_entry_wb_empty", fd.get_address()), Ok(1))
+        });
+        let inputs = incoming_proofs(fd, visits, &blocks, &traces, issue_cells, entry_wb_empty);
         for (trace, mut proof) in traces.iter().zip(inputs.iter().copied()) {
             for &event in &trace.events {
                 match event {
@@ -947,7 +951,7 @@ fn contiguous(visits: &VisitedMap, from: &Address, to: &Address) -> bool {
 }
 
 fn incoming_proofs(
-    fd: &Funcdata, visits: &VisitedMap, blocks: &[BlockId], traces: &[Trace], issue_cells: bool,
+    fd: &Funcdata, visits: &VisitedMap, blocks: &[BlockId], traces: &[Trace], issue_cells: bool, entry_wb_empty: bool,
 ) -> Vec<Proof> {
     let graph = fd.bblocks_ref();
     let mut inputs = vec![Proof::TOP; blocks.len()];
@@ -962,6 +966,7 @@ fn incoming_proofs(
             // A real function entry observes its supplied register values,
             // unlike an unproved intra-function redirect or loop backedge.
             Proof { entry_ages: 1, ff: FF_LIVE, slot_offsets: 1,
+                wb: if entry_wb_empty { 0 } else { OLDER_WB },
                 cells: if issue_cells { u128::MAX } else { 0 }, ..Proof::ENTRY }
         } else if i == 0 || block.size_in() == 0 {
             Proof::ENTRY

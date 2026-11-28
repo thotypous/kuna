@@ -278,6 +278,7 @@ define context contextreg
     carmel_phase_emit = (352,352) noflow
     carmel_pc_store_delta = (353,355) noflow
     carmel_powerplug_absent = (356,356) noflow
+    carmel_entry_wb_empty = (357,357) noflow
     carmel_of_route = (22,23) noflow
     carmel_cliw_95_64 = (32,63) noflow
     carmel_cliw_63_32 = (64,95) noflow

@@ -5622,6 +5622,13 @@ bound to a proved writer in the same physical issue slot. Templates with
 only one assigned ALU operand use the same rule. The lift does not infer a
 zero address or operand.
 
+For a known entry with no in-flight older DATA writeback, the processor
+specification may set `carmel_entry_wb_empty=1` at that CODE entry. This
+permits a phase-checked operand fetch before the ordinary writeback window
+has elapsed. Without the assertion the incoming writeback window is unknown.
+The assertion does not seed issue cells, remove port-conflict checks, or
+apply at an internal edge or to later writebacks.
+
 The covered split stack stores use both reserved addresses even when
 arithmetic is vetoed. A stack address update alone does not imply a DATA
 read or store.
